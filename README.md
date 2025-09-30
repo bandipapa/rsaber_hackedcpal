@@ -1,3 +1,8 @@
+# rsaber_hackedcpal
+
+This library contains hacks to be used by rsaber. For your own projects,
+use the official [cpal](https://crates.io/crates/cpal).
+
 # CPAL - Cross-Platform Audio Library
 
 [![Actions Status](https://github.com/RustAudio/cpal/workflows/cpal/badge.svg)](https://github.com/RustAudio/cpal/actions)

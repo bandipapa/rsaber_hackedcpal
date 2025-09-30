@@ -1,7 +1,7 @@
 [package]
-name = "rsaber_cpal"
+name = "rsaber_hackedcpal"
 version = "0.1.0"
-description = "Low-level cross-platform audio I/O library in pure Rust."
+description = "Hacked audio library for rsaber."
 repository = "https://github.com/rustaudio/cpal"
 documentation = "https://docs.rs/cpal"
 license = "Apache-2.0"
