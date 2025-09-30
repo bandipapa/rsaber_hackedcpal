@@ -23,7 +23,7 @@ mod convert;
 mod java_interface;
 
 use self::android_media::{get_audio_record_min_buffer_size, get_audio_track_min_buffer_size};
-use self::ndk::audio::AudioStream;
+use self::ndk::audio::{AudioPerformanceMode, AudioStream, AudioStreamState, Clockid};
 
 // Android Java API supports up to 8 channels
 // TODO: more channels available in native AAudio
@@ -214,7 +214,7 @@ fn configure_for_device(
     } else {
         builder
     };
-    builder = builder.sample_rate(config.sample_rate.0.try_into().unwrap());
+    builder = builder.sample_rate(config.sample_rate.0.try_into().unwrap()).performance_mode(AudioPerformanceMode::LowLatency);
     match &config.buffer_size {
         BufferSize::Default => builder,
         BufferSize::Fixed(size) => builder.buffer_capacity_in_frames(*size as i32),
@@ -484,5 +484,36 @@ impl StreamTrait for Stream {
             .into()),
             Self::Output(stream) => stream.request_pause().map_err(PauseStreamError::from),
         }
+    }
+
+    fn get_timestamp(&self) -> Option<f64> {
+        // See https://developer.android.com/ndk/reference/group/audio#aaudiostream_gettimestamp .
+
+        let stream = match self {
+            Self::Input(stream) => stream,
+            Self::Output(stream) => stream,
+        };
+
+        if stream.state() != AudioStreamState::Started {
+            return None;
+        }
+
+        let stream_pos = match stream.timestamp(Clockid::Boottime) {
+            Ok(stream_pos) => stream_pos,
+            Err(_) => return None,
+        };
+
+        let mut curr_ts = ndk_sys::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+
+        if unsafe { ndk_sys::clock_gettime(ndk_sys::CLOCK_BOOTTIME.try_into().unwrap(), &mut curr_ts) } != 0 {
+            return None;
+        }
+
+        let sample_rate = stream.sample_rate();
+
+        Some(stream_pos.frame_position as f64 / sample_rate as f64 + curr_ts.tv_sec as f64 + curr_ts.tv_nsec as f64 / 1_000_000_000.0 - stream_pos.time_nanoseconds as f64 / 1_000_000_000.0)
     }
 }

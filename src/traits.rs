@@ -220,4 +220,8 @@ pub trait StreamTrait {
     /// Note: Not all devices support suspending the stream at the hardware level. This method may
     /// fail in these cases.
     fn pause(&self) -> Result<(), PauseStreamError>;
+
+    fn get_timestamp(&self) -> Option<f64> {
+        panic!("Not implemented");
+    }
 }

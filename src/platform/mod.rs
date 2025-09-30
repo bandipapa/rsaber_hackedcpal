@@ -503,6 +503,17 @@ macro_rules! impl_platform_host {
                     )*
                 }
             }
+
+            fn get_timestamp(&self) -> Option<f64> {
+                match self.0 {
+                    $(
+                        $(#[cfg($feat)])?
+                        StreamInner::$HostVariant(ref s) => {
+                            s.get_timestamp()
+                        }
+                    )*
+                }
+            }
         }
 
         impl From<DeviceInner> for Device {

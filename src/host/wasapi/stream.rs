@@ -13,6 +13,11 @@ use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Media::Audio;
 use windows::Win32::System::SystemServices;
 use windows::Win32::System::Threading;
+use windows::Win32::System::Performance;
+
+struct AudioClockWrapper(Audio::IAudioClock);
+unsafe impl Send for AudioClockWrapper {}
+unsafe impl Sync for AudioClockWrapper {}
 
 pub struct Stream {
     /// The high-priority audio processing thread calling callbacks.
@@ -29,6 +34,9 @@ pub struct Stream {
     // This event is signalled after a new entry is added to `commands`, so that the `run()`
     // method can be notified.
     pending_scheduled_event: Foundation::HANDLE,
+
+    audio_clock: AudioClockWrapper,
+    pc_freq: i64,
 }
 
 struct RunContext {
@@ -94,6 +102,10 @@ impl Stream {
         .expect("cpal: could not create input stream event");
         let (tx, rx) = channel();
 
+        let audio_clock = AudioClockWrapper(unsafe { stream_inner.audio_client.GetService::<Audio::IAudioClock>().expect("cpal: unable to get audio clock") });
+        let mut pc_freq = 0;
+        unsafe { Performance::QueryPerformanceFrequency(&mut pc_freq) }.expect("cpal: unable to determine performance counter freq");
+
         let run_context = RunContext {
             handles: vec![pending_scheduled_event, stream_inner.event],
             stream: stream_inner,
@@ -109,6 +121,8 @@ impl Stream {
             thread: Some(thread),
             commands: tx,
             pending_scheduled_event,
+            audio_clock,
+            pc_freq,
         }
     }
 
@@ -127,6 +141,10 @@ impl Stream {
         .expect("cpal: could not create output stream event");
         let (tx, rx) = channel();
 
+        let audio_clock = AudioClockWrapper(unsafe { stream_inner.audio_client.GetService::<Audio::IAudioClock>().expect("cpal: unable to get audio clock") });
+        let mut pc_freq = 0;
+        unsafe { Performance::QueryPerformanceFrequency(&mut pc_freq) }.expect("cpal: unable to determine performance counter freq");
+
         let run_context = RunContext {
             handles: vec![pending_scheduled_event, stream_inner.event],
             stream: stream_inner,
@@ -142,6 +160,8 @@ impl Stream {
             thread: Some(thread),
             commands: tx,
             pending_scheduled_event,
+            audio_clock,
+            pc_freq,
         }
     }
 
@@ -177,6 +197,32 @@ impl StreamTrait for Stream {
         self.push_command(Command::PauseStream)
             .map_err(|_| crate::error::PauseStreamError::DeviceNotAvailable)?;
         Ok(())
+    }
+
+    fn get_timestamp(&self) -> Option<f64> {
+        // See https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclock-getposition .
+
+        let mut stream_pos = 0;
+        let mut stream_pc = 0; // In 100-nanosecond time units.
+
+        match unsafe { self.audio_clock.0.GetPosition(&mut stream_pos, Some(&mut stream_pc)) } {
+            Ok(_) => (),
+            Err(_) => return None,
+        };
+
+        let stream_freq = match unsafe { self.audio_clock.0.GetFrequency() } {
+            Ok(stream_freq) => stream_freq,
+            Err(_) => return None,
+        };
+
+        let mut curr_pc = 0;
+
+        match unsafe { Performance::QueryPerformanceCounter(&mut curr_pc) } {
+            Ok(_) => (),
+            Err(_) => return None,
+        };
+
+        Some(stream_pos as f64 / stream_freq as f64 + curr_pc as f64 / self.pc_freq as f64 - stream_pc as f64 / 10_000_000.0)
     }
 }
 
