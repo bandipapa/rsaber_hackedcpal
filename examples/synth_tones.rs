@@ -8,7 +8,7 @@ extern crate cpal;
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    SizedSample, I24,
+    SizedSample, I24, U24,
 };
 use cpal::{FromSample, Sample};
 
@@ -96,17 +96,18 @@ where
     let (_host, device, config) = host_device_setup()?;
 
     match config.sample_format() {
-        cpal::SampleFormat::I8 => make_stream::<i8>(&device, &config.into()),
-        cpal::SampleFormat::I16 => make_stream::<i16>(&device, &config.into()),
-        cpal::SampleFormat::I24 => make_stream::<I24>(&device, &config.into()),
-        cpal::SampleFormat::I32 => make_stream::<i32>(&device, &config.into()),
-        cpal::SampleFormat::I64 => make_stream::<i64>(&device, &config.into()),
-        cpal::SampleFormat::U8 => make_stream::<u8>(&device, &config.into()),
-        cpal::SampleFormat::U16 => make_stream::<u16>(&device, &config.into()),
-        cpal::SampleFormat::U32 => make_stream::<u32>(&device, &config.into()),
-        cpal::SampleFormat::U64 => make_stream::<u64>(&device, &config.into()),
-        cpal::SampleFormat::F32 => make_stream::<f32>(&device, &config.into()),
-        cpal::SampleFormat::F64 => make_stream::<f64>(&device, &config.into()),
+        cpal::SampleFormat::I8 => make_stream::<i8>(&device, config.into()),
+        cpal::SampleFormat::I16 => make_stream::<i16>(&device, config.into()),
+        cpal::SampleFormat::I24 => make_stream::<I24>(&device, config.into()),
+        cpal::SampleFormat::I32 => make_stream::<i32>(&device, config.into()),
+        cpal::SampleFormat::I64 => make_stream::<i64>(&device, config.into()),
+        cpal::SampleFormat::U8 => make_stream::<u8>(&device, config.into()),
+        cpal::SampleFormat::U16 => make_stream::<u16>(&device, config.into()),
+        cpal::SampleFormat::U24 => make_stream::<U24>(&device, config.into()),
+        cpal::SampleFormat::U32 => make_stream::<u32>(&device, config.into()),
+        cpal::SampleFormat::U64 => make_stream::<u64>(&device, config.into()),
+        cpal::SampleFormat::F32 => make_stream::<f32>(&device, config.into()),
+        cpal::SampleFormat::F64 => make_stream::<f64>(&device, config.into()),
         sample_format => Err(anyhow::Error::msg(format!(
             "Unsupported sample format '{sample_format}'"
         ))),
@@ -120,17 +121,17 @@ pub fn host_device_setup(
     let device = host
         .default_output_device()
         .ok_or_else(|| anyhow::Error::msg("Default output device is not available"))?;
-    println!("Output device : {}", device.name()?);
+    println!("Output device: {}", device.id()?);
 
     let config = device.default_output_config()?;
-    println!("Default output config : {config:?}");
+    println!("Default output config: {config:?}");
 
     Ok((host, device, config))
 }
 
 pub fn make_stream<T>(
     device: &cpal::Device,
-    config: &cpal::StreamConfig,
+    config: cpal::StreamConfig,
 ) -> Result<cpal::Stream, anyhow::Error>
 where
     T: SizedSample + FromSample<f32>,
@@ -138,7 +139,7 @@ where
     let num_channels = config.channels as usize;
     let mut oscillator = Oscillator {
         waveform: Waveform::Sine,
-        sample_rate: config.sample_rate.0 as f32,
+        sample_rate: config.sample_rate as f32,
         current_sample_index: 0.0,
         frequency_hz: 440.0,
     };

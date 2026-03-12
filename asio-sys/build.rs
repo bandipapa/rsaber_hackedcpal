@@ -41,6 +41,14 @@ fn is_msvc() -> bool {
 }
 
 fn main() {
+    // When building on docs.rs, skip the actual build and generate stub bindings
+    if std::env::var("DOCS_RS").is_ok() {
+        println!("cargo:warning=Building for docs.rs - generating stub bindings");
+        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("bad path"));
+        create_stub_bindings(&out_dir);
+        return;
+    }
+
     println!("cargo:rerun-if-env-changed={}", CPAL_ASIO_DIR);
 
     // ASIO SDK directory
@@ -62,6 +70,7 @@ fn main() {
     }
 
     // Print out links to needed libraries
+    println!("cargo:rustc-link-lib=dylib=advapi32");
     println!("cargo:rustc-link-lib=dylib=ole32");
     println!("cargo:rustc-link-lib=dylib=user32");
     println!("cargo:rustc-link-search={}", out_dir.display());
@@ -128,6 +137,17 @@ fn create_lib(cpal_asio_dir: &Path) {
         .files(cpp_paths)
         .cpp(true)
         .compile("libasio.a");
+}
+
+/// Creates stub bindings for docs.rs
+///
+/// Since docs.rs builds in a sandboxed environment without network access
+/// and cannot cross-compile Windows MSVC targets with C++ dependencies,
+/// we generate minimal stub bindings that allow documentation to be built.
+fn create_stub_bindings(out_dir: &Path) {
+    let stub_content = include_str!("asio_stub_bindings.rs");
+    let binding_path = out_dir.join("asio_bindings.rs");
+    std::fs::write(&binding_path, stub_content).expect("Failed to write stub bindings");
 }
 
 fn create_bindings(cpal_asio_dir: &PathBuf) {
@@ -271,7 +291,13 @@ fn get_asio_dir() -> PathBuf {
     // Move the contents of the inner directory to asio_dir
     for entry in walkdir::WalkDir::new(&temp_dir).min_depth(1).max_depth(1) {
         let entry = entry.unwrap();
-        if entry.file_type().is_dir() && entry.file_name().to_string_lossy().starts_with("asio") {
+        if entry.file_type().is_dir()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .to_lowercase()
+                .starts_with("asio")
+        {
             std::fs::rename(entry.path(), &asio_dir).expect("Failed to rename directory");
             break;
         }

@@ -1,7 +1,13 @@
+//! WASAPI backend implementation.
+//!
+//! Default backend on Windows.
+
+#[allow(unused_imports)]
 pub use self::device::{
     default_input_device, default_output_device, Device, Devices, SupportedInputConfigs,
     SupportedOutputConfigs,
 };
+#[allow(unused_imports)]
 pub use self::stream::Stream;
 use crate::traits::HostTrait;
 use crate::BackendSpecificError;
@@ -9,7 +15,6 @@ use crate::DevicesError;
 use std::io::Error as IoError;
 use windows::Win32::Media::Audio;
 
-mod com;
 mod device;
 mod stream;
 
@@ -94,7 +99,9 @@ fn windows_err_to_cpal_err_message<E: ErrDeviceNotAvailable>(
     message: &str,
 ) -> E {
     match e.code() {
-        Audio::AUDCLNT_E_DEVICE_INVALIDATED => E::device_not_available(),
+        Audio::AUDCLNT_E_DEVICE_INVALIDATED | Audio::AUDCLNT_E_DEVICE_IN_USE => {
+            E::device_not_available()
+        }
         _ => {
             let description = format!("{}{}", message, e);
             let err = BackendSpecificError { description };

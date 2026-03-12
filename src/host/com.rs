@@ -1,6 +1,6 @@
 //! Handles COM initialization and cleanup.
 
-use super::IoError;
+use std::io::Error as IoError;
 use std::marker::PhantomData;
 
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
@@ -40,7 +40,6 @@ struct ComInitialized {
 }
 
 impl Drop for ComInitialized {
-    #[inline]
     fn drop(&mut self) {
         // Need to avoid calling CoUninitialize() if CoInitializeEx failed since it may have
         // returned RPC_E_MODE_CHANGED - which is OK, see above.

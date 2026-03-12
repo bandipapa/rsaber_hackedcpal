@@ -1,6 +1,7 @@
 extern crate asio_sys as sys;
 extern crate num_traits;
 
+use crate::host::com;
 use crate::I24;
 
 use self::num_traits::PrimInt;
@@ -20,7 +21,12 @@ pub struct Stream {
     #[allow(dead_code)]
     asio_streams: Arc<Mutex<sys::AsioStreams>>,
     callback_id: sys::CallbackId,
+    message_callback_id: sys::MessageCallbackId,
 }
+
+// Compile-time assertion that Stream is Send and Sync
+crate::assert_stream_send!(Stream);
+crate::assert_stream_sync!(Stream);
 
 impl Stream {
     pub fn play(&self) -> Result<(), PlayStreamError> {
@@ -37,17 +43,27 @@ impl Stream {
 impl Device {
     pub fn build_input_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         mut data_callback: D,
-        _error_callback: E,
+        error_callback: E,
         _timeout: Option<Duration>,
     ) -> Result<Stream, BuildStreamError>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        let stream_type = self.driver.input_data_type().map_err(build_stream_err)?;
+        com::com_initialized();
+        let description = self
+            .description()
+            .map_err(|_| BuildStreamError::DeviceNotAvailable)?;
+        let driver = super::GLOBAL_ASIO
+            .get()
+            .ok_or(BuildStreamError::DeviceNotAvailable)?
+            .load_driver(description.name())
+            .map_err(load_driver_err)?;
+
+        let stream_type = driver.input_data_type().map_err(build_stream_err)?;
 
         // Ensure that the desired sample type is supported.
         let expected_sample_format = super::device::convert_data_type(&stream_type)
@@ -56,8 +72,11 @@ impl Device {
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
 
+        // Register the message callback with the driver
+        let message_callback_id = self.add_message_callback(&driver, error_callback);
+
         let num_channels = config.channels;
-        let buffer_size = self.get_or_create_input_stream(config, sample_format)?;
+        let buffer_size = self.get_or_create_input_stream(&driver, config, sample_format)?;
         let cpal_num_samples = buffer_size * num_channels as usize;
 
         // Create the buffer depending on the size of the data type.
@@ -70,8 +89,7 @@ impl Device {
 
         // Set the input callback.
         // This is most performance critical part of the ASIO bindings.
-        let config = config.clone();
-        let callback_id = self.driver.add_callback(move |callback_info| unsafe {
+        let callback_id = driver.add_callback(move |callback_info| unsafe {
             // If not playing return early.
             if !playing.load(Ordering::SeqCst) {
                 return;
@@ -217,7 +235,7 @@ impl Device {
                 }
 
                 (&sys::AsioSampleType::ASIOSTInt24LSB, SampleFormat::I24) => {
-                    process_input_callback_i24::<I24, _>(
+                    process_input_callback_i24(
                         &mut data_callback,
                         &mut interleaved,
                         asio_stream,
@@ -227,7 +245,7 @@ impl Device {
                     );
                 }
                 (&sys::AsioSampleType::ASIOSTInt24MSB, SampleFormat::I24) => {
-                    process_input_callback_i24::<I24, _>(
+                    process_input_callback_i24(
                         &mut data_callback,
                         &mut interleaved,
                         asio_stream,
@@ -245,33 +263,44 @@ impl Device {
             }
         });
 
-        let driver = self.driver.clone();
+        let driver = Arc::new(driver);
         let asio_streams = self.asio_streams.clone();
 
         // Immediately start the device?
-        self.driver.start().map_err(build_stream_err)?;
+        driver.start().map_err(build_stream_err)?;
 
         Ok(Stream {
             playing: stream_playing,
             driver,
             asio_streams,
             callback_id,
+            message_callback_id,
         })
     }
 
     pub fn build_output_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         mut data_callback: D,
-        _error_callback: E,
+        error_callback: E,
         _timeout: Option<Duration>,
     ) -> Result<Stream, BuildStreamError>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        let stream_type = self.driver.output_data_type().map_err(build_stream_err)?;
+        com::com_initialized();
+        let description = self
+            .description()
+            .map_err(|_| BuildStreamError::DeviceNotAvailable)?;
+        let driver = super::GLOBAL_ASIO
+            .get()
+            .ok_or(BuildStreamError::DeviceNotAvailable)?
+            .load_driver(description.name())
+            .map_err(load_driver_err)?;
+
+        let stream_type = driver.output_data_type().map_err(build_stream_err)?;
 
         // Ensure that the desired sample type is supported.
         let expected_sample_format = super::device::convert_data_type(&stream_type)
@@ -280,21 +309,23 @@ impl Device {
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
 
+        // Register the message callback with the driver
+        let message_callback_id = self.add_message_callback(&driver, error_callback);
+
         let num_channels = config.channels;
-        let buffer_size = self.get_or_create_output_stream(config, sample_format)?;
+        let buffer_size = self.get_or_create_output_stream(&driver, config, sample_format)?;
         let cpal_num_samples = buffer_size * num_channels as usize;
 
         // Create buffers depending on data type.
         let len_bytes = cpal_num_samples * sample_format.sample_size();
         let mut interleaved = vec![0u8; len_bytes];
-        let current_buffer_index = self.current_buffer_index.clone();
+        let current_callback_flag = self.current_callback_flag.clone();
 
         let stream_playing = Arc::new(AtomicBool::new(false));
         let playing = Arc::clone(&stream_playing);
         let asio_streams = self.asio_streams.clone();
 
-        let config = config.clone();
-        let callback_id = self.driver.add_callback(move |callback_info| unsafe {
+        let callback_id = driver.add_callback(move |callback_info| unsafe {
             // If not playing, return early.
             if !playing.load(Ordering::SeqCst) {
                 return;
@@ -309,19 +340,20 @@ impl Device {
 
             // Silence the ASIO buffer that is about to be used.
             //
-            // This checks if any other callbacks have already silenced the buffer associated with
-            // the current `buffer_index`.
+            // Check if any other callbacks have already silenced the buffer associated with
+            // the current callback. The flag is updated once per buffer switch.
             let silence =
-                current_buffer_index.load(Ordering::Acquire) != callback_info.buffer_index;
+                current_callback_flag.load(Ordering::Acquire) != callback_info.callback_flag;
 
             if silence {
-                current_buffer_index.store(callback_info.buffer_index, Ordering::Release);
+                current_callback_flag.store(callback_info.callback_flag, Ordering::Release);
             }
 
             /// 1. Render the given callback to the given buffer of interleaved samples.
             /// 2. If required, silence the ASIO buffer.
             /// 3. Finally, write the interleaved data to the non-interleaved ASIO buffer,
             ///    performing endianness conversions as necessary.
+            #[allow(clippy::too_many_arguments)]
             unsafe fn process_output_callback<A, D, F>(
                 data_callback: &mut D,
                 interleaved: &mut [u8],
@@ -519,17 +551,18 @@ impl Device {
             }
         });
 
-        let driver = self.driver.clone();
+        let driver = Arc::new(driver);
         let asio_streams = self.asio_streams.clone();
 
         // Immediately start the device?
-        self.driver.start().map_err(build_stream_err)?;
+        driver.start().map_err(build_stream_err)?;
 
         Ok(Stream {
             playing: stream_playing,
             driver,
             asio_streams,
             callback_id,
+            message_callback_id,
         })
     }
 
@@ -540,16 +573,15 @@ impl Device {
     /// On success, the buffer size of the stream is returned.
     fn get_or_create_input_stream(
         &self,
-        config: &StreamConfig,
+        driver: &sys::Driver,
+        config: StreamConfig,
         sample_format: SampleFormat,
     ) -> Result<usize, BuildStreamError> {
-        match self.default_input_config() {
-            Ok(f) => {
-                let num_asio_channels = f.channels;
-                check_config(&self.driver, config, sample_format, num_asio_channels)
-            }
-            Err(_) => Err(BuildStreamError::StreamConfigNotSupported),
-        }?;
+        let num_asio_channels = self
+            .default_input_config()
+            .map_err(|_| BuildStreamError::StreamConfigNotSupported)?
+            .channels;
+        check_config(driver, config, sample_format, num_asio_channels)?;
         let num_channels = config.channels as usize;
         let mut streams = self.asio_streams.lock().unwrap();
 
@@ -564,7 +596,7 @@ impl Device {
             Some(ref input) => Ok(input.buffer_size as usize),
             None => {
                 let output = streams.output.take();
-                self.driver
+                driver
                     .prepare_input_stream(output, num_channels, buffer_size)
                     .map(|new_streams| {
                         let bs = match new_streams.input {
@@ -587,16 +619,15 @@ impl Device {
     /// If there is no existing ASIO Output Stream it will be created.
     fn get_or_create_output_stream(
         &self,
-        config: &StreamConfig,
+        driver: &sys::Driver,
+        config: StreamConfig,
         sample_format: SampleFormat,
     ) -> Result<usize, BuildStreamError> {
-        match self.default_output_config() {
-            Ok(f) => {
-                let num_asio_channels = f.channels;
-                check_config(&self.driver, config, sample_format, num_asio_channels)
-            }
-            Err(_) => Err(BuildStreamError::StreamConfigNotSupported),
-        }?;
+        let num_asio_channels = self
+            .default_output_config()
+            .map_err(|_| BuildStreamError::StreamConfigNotSupported)?
+            .channels;
+        check_config(driver, config, sample_format, num_asio_channels)?;
         let num_channels = config.channels as usize;
         let mut streams = self.asio_streams.lock().unwrap();
 
@@ -611,7 +642,7 @@ impl Device {
             Some(ref output) => Ok(output.buffer_size as usize),
             None => {
                 let input = streams.input.take();
-                self.driver
+                driver
                     .prepare_output_stream(input, num_channels, buffer_size)
                     .map(|new_streams| {
                         let bs = match new_streams.output {
@@ -628,32 +659,49 @@ impl Device {
             }
         }
     }
+
+    fn add_message_callback<E>(
+        &self,
+        driver: &sys::Driver,
+        error_callback: E,
+    ) -> sys::MessageCallbackId
+    where
+        E: FnMut(StreamError) + Send + 'static,
+    {
+        let error_callback_shared = Arc::new(Mutex::new(error_callback));
+
+        driver.add_message_callback(move |msg| {
+            // Check specifically for ResetRequest
+            if let sys::AsioMessageSelectors::kAsioResetRequest = msg {
+                if let Ok(mut cb) = error_callback_shared.lock() {
+                    cb(StreamError::StreamInvalidated);
+                }
+            }
+        })
+    }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
         self.driver.remove_callback(self.callback_id);
+        self.driver
+            .remove_message_callback(self.message_callback_id);
     }
-}
-
-fn asio_ns_to_double(val: sys::bindings::asio_import::ASIOTimeStamp) -> f64 {
-    let two_raised_to_32 = 4294967296.0;
-    val.lo as f64 + val.hi as f64 * two_raised_to_32
 }
 
 /// Asio retrieves system time via `timeGetTime` which returns the time in milliseconds.
 fn system_time_to_stream_instant(
     system_time: sys::bindings::asio_import::ASIOTimeStamp,
 ) -> crate::StreamInstant {
-    let systime_ns = asio_ns_to_double(system_time);
-    let secs = systime_ns as i64 / 1_000_000_000;
-    let nanos = (systime_ns as i64 - secs * 1_000_000_000) as u32;
-    crate::StreamInstant::new(secs, nanos)
+    let nanos = (system_time.hi as u64) << 32 | system_time.lo as u64;
+    crate::StreamInstant::from_nanos_i128(nanos as i128)
+        .expect("`system_time` out of range of `StreamInstant` representation")
 }
 
-/// Convert the given duration in frames at the given sample rate to a `std::time::Duration`.
+// Convert the given duration in frames at the given sample rate to a `std::time::Duration`.
+#[inline]
 fn frames_to_duration(frames: usize, rate: crate::SampleRate) -> std::time::Duration {
-    let secsf = frames as f64 / rate.0 as f64;
+    let secsf = frames as f64 / rate as f64;
     let secs = secsf as u64;
     let nanos = ((secsf - secs as f64) * 1_000_000_000.0) as u32;
     std::time::Duration::new(secs, nanos)
@@ -661,20 +709,33 @@ fn frames_to_duration(frames: usize, rate: crate::SampleRate) -> std::time::Dura
 
 /// Check whether or not the desired config is supported by the stream.
 ///
-/// Checks sample rate, data type and then finally the number of channels.
+/// Checks sample rate, data type, number of channels, and buffer size.
 fn check_config(
     driver: &sys::Driver,
-    config: &StreamConfig,
+    config: StreamConfig,
     sample_format: SampleFormat,
     num_asio_channels: u16,
 ) -> Result<(), BuildStreamError> {
     let StreamConfig {
         channels,
         sample_rate,
-        buffer_size: _,
+        buffer_size,
     } = config;
+
+    // Validate buffer size if `Fixed` is specified. This is necessary because ASIO's
+    // `create_buffers` only validates the upper bound (returns `InvalidBufferSize` if > max) but
+    // does NOT validate the lower bound. Passing a buffer size below min would be accepted but
+    // behavior is unspecified.
+    if let BufferSize::Fixed(requested_size) = buffer_size {
+        let (min, max) = driver.buffersize_range().map_err(build_stream_err)?;
+        let requested_size_i32 = requested_size as i32;
+        if !(min..=max).contains(&requested_size_i32) {
+            return Err(BuildStreamError::StreamConfigNotSupported);
+        }
+    }
+
     // Try and set the sample rate to what the user selected.
-    let sample_rate = sample_rate.0.into();
+    let sample_rate = sample_rate.into();
     if sample_rate != driver.sample_rate().map_err(build_stream_err)? {
         if driver
             .can_sample_rate(sample_rate)
@@ -692,7 +753,7 @@ fn check_config(
         SampleFormat::I16 | SampleFormat::I24 | SampleFormat::I32 | SampleFormat::F32 => (),
         _ => return Err(BuildStreamError::StreamConfigNotSupported),
     }
-    if *channels > num_asio_channels {
+    if channels > num_asio_channels {
         return Err(BuildStreamError::StreamConfigNotSupported);
     }
     Ok(())
@@ -728,7 +789,7 @@ unsafe fn asio_channel_slice<T>(
 ) -> &[T] {
     let channel_length = requested_channel_length.unwrap_or(asio_stream.buffer_size as usize);
     let buff_ptr: *const T =
-        asio_stream.buffer_infos[channel_index].buffers[buffer_index as usize] as *const _;
+        asio_stream.buffer_infos[channel_index].buffers[buffer_index] as *const _;
     std::slice::from_raw_parts(buff_ptr, channel_length)
 }
 
@@ -743,9 +804,17 @@ unsafe fn asio_channel_slice_mut<T>(
     requested_channel_length: Option<usize>,
 ) -> &mut [T] {
     let channel_length = requested_channel_length.unwrap_or(asio_stream.buffer_size as usize);
-    let buff_ptr: *mut T =
-        asio_stream.buffer_infos[channel_index].buffers[buffer_index as usize] as *mut _;
+    let buff_ptr: *mut T = asio_stream.buffer_infos[channel_index].buffers[buffer_index] as *mut _;
     std::slice::from_raw_parts_mut(buff_ptr, channel_length)
+}
+
+fn load_driver_err(e: sys::LoadDriverError) -> BuildStreamError {
+    match e {
+        sys::LoadDriverError::LoadDriverFailed | sys::LoadDriverError::DriverAlreadyExists => {
+            BuildStreamError::DeviceNotAvailable
+        }
+        sys::LoadDriverError::InitializationFailed(asio_err) => build_stream_err(asio_err),
+    }
 }
 
 fn build_stream_err(e: sys::AsioError) -> BuildStreamError {
@@ -845,7 +914,7 @@ unsafe fn process_output_callback_i24<D>(
     }
 }
 
-unsafe fn process_input_callback_i24<A, D>(
+unsafe fn process_input_callback_i24<D>(
     data_callback: &mut D,
     interleaved: &mut [u8],
     asio_stream: &sys::AsioStream,
@@ -853,7 +922,6 @@ unsafe fn process_input_callback_i24<A, D>(
     sample_rate: crate::SampleRate,
     little_endian: bool,
 ) where
-    A: Copy,
     D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
 {
     let format = SampleFormat::I24;
