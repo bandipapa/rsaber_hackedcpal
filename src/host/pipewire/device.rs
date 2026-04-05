@@ -1,10 +1,10 @@
+use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
 use std::{cell::RefCell, rc::Rc};
+use std::sync::atomic::Ordering;
 
 use crate::host::pipewire::stream::{StreamCommand, StreamData, SUPPORTED_FORMATS};
-use crate::host::pipewire::utils::{
-    audio, clock, group, DEVICE_ICON_NAME, METADATA_NAME, PORT_GROUP,
-};
+use crate::host::pipewire::utils::{audio, clock, DEVICE_ICON_NAME, METADATA_NAME};
 use crate::{traits::DeviceTrait, DeviceDirection, SupportedStreamConfigRange};
 use crate::{ChannelCount, FrameCount, InterfaceType, SampleRate};
 
@@ -21,7 +21,6 @@ use std::thread;
 
 use super::stream::Stream;
 
-use std::sync::Arc;
 use atomic::Atomic;
 use super::stream::StreamPos;
 
@@ -301,6 +300,12 @@ impl DeviceTrait for Device {
         let (pw_init_tx, pw_init_rx) = std::sync::mpsc::channel::<bool>();
         let device = self.clone();
         let wait_timeout = timeout.unwrap_or(Duration::from_secs(2));
+        let initial_quantum = match config.buffer_size {
+            crate::BufferSize::Fixed(n) => n as u64,
+            crate::BufferSize::Default => self.quantum as u64,
+        };
+        let last_quantum = Arc::new(AtomicU64::new(initial_quantum));
+        let last_quantum_clone = last_quantum.clone();
 
         let pos = Arc::new(Atomic::new(StreamPos::default()));
         let pos_clone = Arc::clone(&pos);
@@ -320,7 +325,8 @@ impl DeviceTrait for Device {
                     sample_format,
                     data_callback,
                     error_callback,
-                    pos_clone,
+                    last_quantum_clone,
+                    Arc::clone(&pos_clone),
                 )
                 else {
                     let _ = pw_init_tx.send(false);
@@ -332,6 +338,7 @@ impl DeviceTrait for Device {
                 let _receiver = pw_play_rx.attach(mainloop.loop_(), move |play| match play {
                     StreamCommand::Toggle(state) => {
                         let _ = stream.set_active(state);
+                        set_active_stream_pos(Arc::clone(&pos_clone), state);
                     }
                     StreamCommand::Stop => {
                         let _ = stream.disconnect();
@@ -351,6 +358,7 @@ impl DeviceTrait for Device {
             Ok(true) => Ok(Stream {
                 handle: Some(handle),
                 controller: pw_play_tx,
+                last_quantum,
                 pos,
             }),
             Ok(false) => Err(crate::BuildStreamError::StreamConfigNotSupported),
@@ -379,6 +387,12 @@ impl DeviceTrait for Device {
         let (pw_init_tx, pw_init_rx) = std::sync::mpsc::channel::<bool>();
         let device = self.clone();
         let wait_timeout = timeout.unwrap_or(Duration::from_secs(2));
+        let initial_quantum = match config.buffer_size {
+            crate::BufferSize::Fixed(n) => n as u64,
+            crate::BufferSize::Default => self.quantum as u64,
+        };
+        let last_quantum = Arc::new(AtomicU64::new(initial_quantum));
+        let last_quantum_clone = last_quantum.clone();
 
         let pos = Arc::new(Atomic::new(StreamPos::default()));
         let pos_clone = Arc::clone(&pos);
@@ -399,7 +413,8 @@ impl DeviceTrait for Device {
                     sample_format,
                     data_callback,
                     error_callback,
-                    pos_clone,
+                    last_quantum_clone,
+                    Arc::clone(&pos_clone),
                 )
                 else {
                     let _ = pw_init_tx.send(false);
@@ -412,6 +427,7 @@ impl DeviceTrait for Device {
                 let _receiver = pw_play_rx.attach(mainloop.loop_(), move |play| match play {
                     StreamCommand::Toggle(state) => {
                         let _ = stream.set_active(state);
+                        set_active_stream_pos(Arc::clone(&pos_clone), state);
                     }
                     StreamCommand::Stop => {
                         let _ = stream.disconnect();
@@ -431,6 +447,7 @@ impl DeviceTrait for Device {
             Ok(true) => Ok(Stream {
                 handle: Some(handle),
                 controller: pw_play_tx,
+                last_quantum,
                 pos,
             }),
             Ok(false) => Err(crate::BuildStreamError::StreamConfigNotSupported),
@@ -441,6 +458,19 @@ impl DeviceTrait for Device {
             }),
         }
     }
+}
+
+fn set_active_stream_pos(pos: Arc<Atomic<StreamPos>>, active: bool) {
+    let mut pos_inner = pos.load(Ordering::Relaxed);
+
+    if active {
+        pos_inner.running = 1;
+    } else {
+        pos_inner.running = 0;
+        pos_inner.stopped_ts = pos_inner.ts;
+    }
+
+    pos.store(pos_inner, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -638,20 +668,12 @@ pub fn init_devices() -> Option<Vec<Device>> {
                                     return;
                                 }
                             };
-                            let Some(group) = props.get(PORT_GROUP) else {
-                                return;
-                            };
-                            let direction = match (group, role) {
-                                (group::PLAY_BACK, Role::Sink) => DeviceDirection::Duplex,
-                                (group::PLAY_BACK, Role::Source) => DeviceDirection::Output,
-                                (group::CAPTURE, _) => DeviceDirection::Input,
-                                (_, Role::Sink) => DeviceDirection::Output,
-                                (_, Role::Source) => DeviceDirection::Input,
-                                (_, Role::Duplex) => DeviceDirection::Duplex,
-                                // Bluetooth and other non-ALSA devices use generic port group
-                                // names like "stream.0" — derive direction from media.class
-                                (_, Role::StreamOutput) => DeviceDirection::Output,
-                                (_, Role::StreamInput) => DeviceDirection::Input,
+                            let direction = match role {
+                                Role::Sink => DeviceDirection::Duplex,
+                                Role::Source => DeviceDirection::Input,
+                                Role::Duplex => DeviceDirection::Duplex,
+                                Role::StreamOutput => DeviceDirection::Output,
+                                Role::StreamInput => DeviceDirection::Input,
                             };
                             let Some(object_serial) = props
                                 .get(*pw::keys::OBJECT_SERIAL)

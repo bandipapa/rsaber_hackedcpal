@@ -262,6 +262,19 @@ impl StreamTrait for Stream {
 
         stream.pause()
     }
+
+    fn now(&self) -> crate::StreamInstant {
+        let m_host_time = unsafe { mach2::mach_time::mach_absolute_time() };
+        host_time_to_stream_instant(m_host_time).expect("mach_timebase_info failed")
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        let stream = self.inner.lock().unwrap();
+
+        device::get_device_buffer_frame_size(&stream.audio_unit)
+            .map(|size| size as crate::FrameCount)
+            .map_err(|_| crate::StreamError::DeviceNotAvailable)
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,10 @@
-use std::{thread::JoinHandle, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    thread::JoinHandle,
+};
 
 use crate::{
     host::fill_with_equilibrium, traits::StreamTrait, BackendSpecificError, InputCallbackInfo,
@@ -20,9 +26,10 @@ use pipewire::{
 
 use crate::Data;
 
-use std::sync::Arc;
-use atomic::{Atomic, Ordering};
+use atomic::Atomic;
 use bytemuck::NoUninit;
+
+const NSEC_PER_SEC: f64 = 1_000_000_000.0;
 
 #[derive(Debug, Clone, Copy)]
 pub enum StreamCommand {
@@ -33,16 +40,18 @@ pub enum StreamCommand {
 pub struct Stream {
     pub(crate) handle: Option<JoinHandle<()>>,
     pub(crate) controller: pw::channel::Sender<StreamCommand>,
+    pub(crate) last_quantum: Arc<AtomicU64>,
     pub(crate) pos: Arc<Atomic<StreamPos>>,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, NoUninit)]
 pub struct StreamPos {
-    now: u64,
-    num: u64,
-    denom: u64,
-    ticks: u64,
+    pub(crate) frames: usize,
+    pub(crate) ts: f64,
+    pub(crate) pos: f64,
+    pub(crate) stopped_ts: f64,
+    pub(crate) running: u64, // TODO: bool
 }
 
 impl Drop for Stream {
@@ -74,30 +83,39 @@ impl StreamTrait for Stream {
         Ok(())
     }
 
+    fn now(&self) -> crate::StreamInstant {
+        monotonic_stream_instant().expect("clock_gettime failed")
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        Ok(self.last_quantum.load(Ordering::Relaxed) as _)
+    }
+
     fn get_timestamp(&self) -> Option<f64> {
-        // FIXME: stream_RT, pause test!
-        let pos = self.pos.load(Ordering::Relaxed);
+        // TODO: stream.connect: RT_PROCESS
+        let pos_inner = self.pos.load(Ordering::Relaxed);
 
-        if pos.num == 0 || pos.denom == 0 {
+        // Implementation note:
+        // - After stop->start, we need to wait for update_stream_pos() to receive
+        //   an up-to-date timestamp.
+        // - Testing of pos_inner.running is not sufficient, since computing
+        //   curr_ts - pos_inner.ts will result in an incorrect timestamp.
+
+        if pos_inner.ts == pos_inner.stopped_ts {
             return None;
         }
 
-        // pw_stream_get_nsec(stream): we don't have ref to stream!
-        // See https://docs.pipewire.org/structpw__time.html
+        // pw_stream_get_nsec(): we don't have reference to stream, so replicate
+        // actual implementation here, see https://docs.pipewire.org/structpw__time.html .
 
-        let mut curr_ts = libc::timespec::default();
+        let mut curr_timespec = libc::timespec::default();
 
-        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut curr_ts) } != 0 {
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut curr_timespec) } != 0 {
             return None;
         }
 
-        let now = (curr_ts.tv_sec * 1_000_000_000 + curr_ts.tv_nsec) as u64;
-
-        let diff = now - pos.now;
-        let elapsed = (pos.denom * diff) / (pos.num * 1_000_000_000);
-        let extra_p = (pos.ticks + elapsed) * 1000 * pos.num / pos.denom;
-
-        Some(extra_p as f64 / 1000.0)
+        let curr_ts = curr_timespec.tv_sec as f64 + curr_timespec.tv_nsec as f64 / NSEC_PER_SEC;
+        Some(pos_inner.pos + curr_ts - pos_inner.ts)
     }
 }
 
@@ -167,7 +185,7 @@ pub struct UserData<D, E> {
     error_callback: E,
     sample_format: SampleFormat,
     format: pw::spa::param::audio::AudioInfoRaw,
-    created_instance: Instant,
+    last_quantum: Arc<AtomicU64>,
 }
 impl<D, E> UserData<D, E>
 where
@@ -210,7 +228,7 @@ fn pw_stream_time(stream: &pw::stream::Stream) -> Option<PwTime> {
             std::mem::size_of::<pw::sys::pw_time>(),
         )
     };
-    if rc != 0 || t.now == 0 || t.rate.denom == 0 {
+    if rc != 0 || t.now <= 0 || t.rate.denom == 0 {
         return None;
     }
     debug_assert_eq!(t.rate.num, 1, "unexpected pw_time rate.num");
@@ -233,44 +251,27 @@ where
         data: &Data,
         pos: Arc<Atomic<StreamPos>>,
     ) -> Result<(), BackendSpecificError> {
+        self.last_quantum.store(frames as u64, Ordering::Relaxed);
         let (callback, capture) = match pw_stream_time(stream) {
             Some(PwTime { now_ns, delay_ns }) => (
-                StreamInstant::from_nanos(now_ns),
-                StreamInstant::from_nanos(now_ns - delay_ns),
+                StreamInstant::from_nanos(now_ns as u64),
+                StreamInstant::from_nanos((now_ns - delay_ns.max(0)) as u64),
             ),
             None => {
-                let cb = stream_timestamp_fallback(self.created_instance)?;
-                let pl = cb
-                    .sub(frames_to_duration(frames, self.format.rate()))
-                    .ok_or_else(|| BackendSpecificError {
-                        description:
-                            "`capture` occurs beyond representation supported by `StreamInstant`"
-                                .to_string(),
-                    })?;
-                (cb, pl)
+                let cb = monotonic_stream_instant().ok_or_else(|| BackendSpecificError {
+                    description: "clock_gettime failed".to_owned(),
+                })?;
+                let capture = cb
+                    .checked_sub(frames_to_duration(frames, self.format.rate()))
+                    .unwrap_or(crate::StreamInstant::ZERO);
+                (cb, capture)
             }
         };
         let timestamp = crate::InputStreamTimestamp { callback, capture };
         let info = InputCallbackInfo { timestamp };
         (self.data_callback)(data, &info);
 
-        let mut t: pw::sys::pw_time = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            pw::sys::pw_stream_get_time_n(
-                stream.as_raw_ptr(),
-                &mut t,
-                std::mem::size_of::<pw::sys::pw_time>(),
-            )
-        };
-        if !(rc != 0 || t.now == 0 || t.rate.denom == 0) {
-            let p = StreamPos {
-                now: t.now as u64,
-                num: t.rate.num as u64,
-                denom: t.rate.denom as u64,
-                ticks: t.ticks as u64,
-            };
-            pos.store(p, Ordering::Relaxed);
-        }
+        update_stream_pos(stream, frames, pos, self.format.rate());
 
         Ok(())
     }
@@ -287,20 +288,17 @@ where
         data: &mut Data,
         pos: Arc<Atomic<StreamPos>>,
     ) -> Result<(), BackendSpecificError> {
+        self.last_quantum.store(frames as u64, Ordering::Relaxed);
         let (callback, playback) = match pw_stream_time(stream) {
             Some(PwTime { now_ns, delay_ns }) => (
-                StreamInstant::from_nanos(now_ns),
-                StreamInstant::from_nanos(now_ns + delay_ns),
+                StreamInstant::from_nanos(now_ns as u64),
+                StreamInstant::from_nanos((now_ns + delay_ns.max(0)) as u64),
             ),
             None => {
-                let cb = stream_timestamp_fallback(self.created_instance)?;
-                let pl = cb
-                    .add(frames_to_duration(frames, self.format.rate()))
-                    .ok_or_else(|| BackendSpecificError {
-                        description:
-                            "`playback` occurs beyond representation supported by `StreamInstant`"
-                                .to_string(),
-                    })?;
+                let cb = monotonic_stream_instant().ok_or_else(|| BackendSpecificError {
+                    description: "clock_gettime failed".to_owned(),
+                })?;
+                let pl = cb + frames_to_duration(frames, self.format.rate());
                 (cb, pl)
             }
         };
@@ -308,27 +306,38 @@ where
         let info = OutputCallbackInfo { timestamp };
         (self.data_callback)(data, &info);
 
-        let mut t: pw::sys::pw_time = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            pw::sys::pw_stream_get_time_n(
-                stream.as_raw_ptr(),
-                &mut t,
-                std::mem::size_of::<pw::sys::pw_time>(),
-            )
-        };
-        if !(rc != 0 || t.now == 0 || t.rate.denom == 0) {
-            let p = StreamPos {
-                now: t.now as u64,
-                num: t.rate.num as u64,
-                denom: t.rate.denom as u64,
-                ticks: t.ticks as u64,
-            };
-            pos.store(p, Ordering::Relaxed);
-        }
+        update_stream_pos(stream, frames, pos, self.format.rate());
 
         Ok(())
     }
 }
+
+fn update_stream_pos(stream: &pw::stream::Stream, frames: usize, pos: Arc<Atomic<StreamPos>>, rate: u32) {
+    let mut t: pw::sys::pw_time = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        pw::sys::pw_stream_get_time_n(
+            stream.as_raw_ptr(),
+            &mut t,
+            std::mem::size_of::<pw::sys::pw_time>(),
+        )
+    };
+
+    if !(rc != 0 || t.now <= 0 || t.rate.denom == 0) {
+        let mut pos_inner = pos.load(Ordering::Relaxed);
+        let rate = rate as f64;
+
+        pos_inner.frames += frames;
+        pos_inner.ts = t.now as f64 / NSEC_PER_SEC;
+        pos_inner.pos = pos_inner.frames as f64 / rate - ((t.queued + t.buffered) as f64 / rate + t.delay as f64 * t.rate.num as f64 / t.rate.denom as f64);
+
+        if pos_inner.running == 0 {
+            pos_inner.stopped_ts = pos_inner.ts;
+        }
+
+        pos.store(pos_inner, Ordering::Relaxed);
+    }
+}
+
 pub struct StreamData<D, E> {
     pub mainloop: MainLoopRc,
     pub listener: StreamListener<UserData<D, E>>,
@@ -336,18 +345,22 @@ pub struct StreamData<D, E> {
     pub context: ContextRc,
 }
 
-// Use elapsed duration since stream creation as fallback when hardware timestamps are unavailable.
-//
-// This ensures positive values that are compatible with our `StreamInstant` representation.
-#[inline]
-fn stream_timestamp_fallback(
-    creation: std::time::Instant,
-) -> Result<StreamInstant, BackendSpecificError> {
-    let now = std::time::Instant::now();
-    let duration = now.duration_since(creation);
-    StreamInstant::from_nanos_i128(duration.as_nanos() as i128).ok_or(BackendSpecificError {
-        description: "stream duration has exceeded `StreamInstant` representation".to_string(),
-    })
+/// Read `clock_gettime` and return it as a [`StreamInstant`].
+///
+/// This is the same clock used by `pw_stream_get_time_n` (`pw_time.now`), so values
+/// returned here are directly comparable with the `callback`/`capture`/`playback`
+/// instants delivered to the data callback.
+fn monotonic_stream_instant() -> Option<StreamInstant> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc == 0 {
+        Some(StreamInstant::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+    } else {
+        None
+    }
 }
 
 // Convert the given duration in frames at the given sample rate to a `std::time::Duration`.
@@ -365,6 +378,7 @@ pub fn connect_output<D, E>(
     sample_format: SampleFormat,
     data_callback: D,
     error_callback: E,
+    last_quantum: Arc<AtomicU64>,
     pos: Arc<Atomic<StreamPos>>,
 ) -> Result<StreamData<D, E>, pw::Error>
 where
@@ -381,7 +395,7 @@ where
         error_callback,
         sample_format,
         format: Default::default(),
-        created_instance: Instant::now(),
+        last_quantum,
     };
     let channels = config.channels as _;
     let rate = config.sample_rate as _;
@@ -516,6 +530,7 @@ pub fn connect_input<D, E>(
     sample_format: SampleFormat,
     data_callback: D,
     error_callback: E,
+    last_quantum: Arc<AtomicU64>,
     pos: Arc<Atomic<StreamPos>>,
 ) -> Result<StreamData<D, E>, pw::Error>
 where
@@ -532,7 +547,7 @@ where
         error_callback,
         sample_format,
         format: Default::default(),
-        created_instance: Instant::now(),
+        last_quantum,
     };
 
     let channels = config.channels as _;

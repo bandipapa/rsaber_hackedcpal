@@ -16,8 +16,9 @@ use crate::{
     BackendSpecificError, BufferSize, BuildStreamError, ChannelCount, Data,
     DefaultStreamConfigError, DeviceDescription, DeviceDescriptionBuilder, DeviceId, DeviceIdError,
     DeviceNameError, DevicesError, InputCallbackInfo, OutputCallbackInfo, PauseStreamError,
-    PlayStreamError, SampleFormat, SampleRate, StreamConfig, StreamError, SupportedBufferSize,
-    SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
+    PlayStreamError, SampleFormat, SampleRate, StreamConfig, StreamError, StreamInstant,
+    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
+    SupportedStreamConfigsError,
 };
 
 use self::enumerate::{
@@ -274,10 +275,18 @@ impl StreamTrait for Stream {
                 let err = BackendSpecificError { description };
                 return Err(err.into());
             }
-
             stream.playing = false;
         }
         Ok(())
+    }
+
+    fn now(&self) -> StreamInstant {
+        let m_host_time = unsafe { mach2::mach_time::mach_absolute_time() };
+        host_time_to_stream_instant(m_host_time).expect("mach_timebase_info failed")
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        Ok(get_device_buffer_frames() as crate::FrameCount)
     }
 }
 
@@ -498,9 +507,7 @@ where
             }
         });
         let delay = frames_to_duration(latency_frames, sample_rate);
-        let capture = callback
-            .sub(delay)
-            .expect("`capture` occurs before origin of alsa `StreamInstant`");
+        let capture = callback.checked_sub(delay).unwrap_or(StreamInstant::ZERO);
         let timestamp = crate::InputStreamTimestamp { callback, capture };
 
         let info = InputCallbackInfo { timestamp };
@@ -549,9 +556,7 @@ where
             }
         });
         let delay = frames_to_duration(latency_frames, sample_rate);
-        let playback = callback
-            .add(delay)
-            .expect("`playback` occurs beyond representation supported by `StreamInstant`");
+        let playback = callback + delay;
         let timestamp = crate::OutputStreamTimestamp { callback, playback };
 
         let info = OutputCallbackInfo { timestamp };

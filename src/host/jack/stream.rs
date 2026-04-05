@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     BackendSpecificError, Data, InputCallbackInfo, OutputCallbackInfo, PauseStreamError,
-    PlayStreamError, SampleRate, StreamError,
+    PlayStreamError, SampleRate, StreamError, StreamInstant,
 };
 
 use super::JACK_SAMPLE_FORMAT;
@@ -220,6 +220,14 @@ impl StreamTrait for Stream {
         self.playing.store(false, Ordering::SeqCst);
         Ok(())
     }
+
+    fn now(&self) -> StreamInstant {
+        micros_to_stream_instant(self.async_client.as_client().time())
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        Ok(self.async_client.as_client().buffer_size() as crate::FrameCount)
+    }
 }
 
 type InputDataCallback = Box<dyn FnMut(&Data, &InputCallbackInfo) + Send + 'static>;
@@ -239,7 +247,6 @@ struct LocalProcessHandler {
     temp_input_buffer: Vec<f32>,
     temp_output_buffer: Vec<f32>,
     playing: Arc<AtomicBool>,
-    creation_timestamp: std::time::Instant,
     /// This should not be called on `process`, only on `buffer_size` because it can block.
     error_callback_ptr: ErrorCallbackPtr,
 }
@@ -270,7 +277,6 @@ impl LocalProcessHandler {
             temp_input_buffer,
             temp_output_buffer,
             playing,
-            creation_timestamp: std::time::Instant::now(),
             error_callback_ptr,
         }
     }
@@ -284,7 +290,11 @@ fn temp_buffer_to_data(temp_input_buffer: &mut [f32], total_buffer_size: usize) 
 }
 
 impl jack::ProcessHandler for LocalProcessHandler {
-    fn process(&mut self, _: &jack::Client, process_scope: &jack::ProcessScope) -> jack::Control {
+    fn process(
+        &mut self,
+        client: &jack::Client,
+        process_scope: &jack::ProcessScope,
+    ) -> jack::Control {
         if !self.playing.load(Ordering::SeqCst) {
             return jack::Control::Continue;
         }
@@ -294,24 +304,21 @@ impl jack::ProcessHandler for LocalProcessHandler {
         let current_frame_count = process_scope.n_frames() as usize;
 
         // Get timestamp data
-        let cycle_times = process_scope.cycle_times();
-        let current_start_usecs = match cycle_times {
-            Ok(times) => times.current_usecs,
+        let (current_start_usecs, next_usecs_opt) = match process_scope.cycle_times() {
+            Ok(times) => (times.current_usecs, Some(times.next_usecs)),
             Err(_) => {
-                // jack was unable to get the current time information
-                // Fall back to using Instants
-                let now = std::time::Instant::now();
-                let duration = now.duration_since(self.creation_timestamp);
-                duration.as_micros() as u64
+                // JACK was unable to get the current time information.
+                // Fall back to jack_get_time(), which is the same clock source
+                // used by now() and cycle_times(), so the epoch stays consistent.
+                (client.time(), None)
             }
         };
         let start_cycle_instant = micros_to_stream_instant(current_start_usecs);
         let start_callback_instant = start_cycle_instant
-            .add(frames_to_duration(
+            + frames_to_duration(
                 process_scope.frames_since_cycle_start() as usize,
                 self.sample_rate,
-            ))
-            .expect("`playback` occurs beyond representation supported by `StreamInstant`");
+            );
 
         if let Some(input_callback) = &mut self.input_data_callback {
             // Let's get the data from the input ports and run the callback
@@ -332,13 +339,9 @@ impl jack::ProcessHandler for LocalProcessHandler {
                 current_frame_count * num_in_channels,
             );
             // Create timestamp
-            let frames_since_cycle_start = process_scope.frames_since_cycle_start() as usize;
-            let duration_since_cycle_start =
-                frames_to_duration(frames_since_cycle_start, self.sample_rate);
-            let callback = start_callback_instant
-                .add(duration_since_cycle_start)
-                .expect("`playback` occurs beyond representation supported by `StreamInstant`");
-            let capture = start_callback_instant;
+            let callback = start_callback_instant;
+            // Input data was made available at the start of the cycle (current_usecs).
+            let capture = start_cycle_instant;
             let timestamp = crate::InputStreamTimestamp { callback, capture };
             let info = crate::InputCallbackInfo { timestamp };
             input_callback(&data, &info);
@@ -353,16 +356,15 @@ impl jack::ProcessHandler for LocalProcessHandler {
                 current_frame_count * num_out_channels,
             );
             // Create timestamp
-            let frames_since_cycle_start = process_scope.frames_since_cycle_start() as usize;
-            let duration_since_cycle_start =
-                frames_to_duration(frames_since_cycle_start, self.sample_rate);
-            let callback = start_callback_instant
-                .add(duration_since_cycle_start)
-                .expect("`playback` occurs beyond representation supported by `StreamInstant`");
-            let buffer_duration = frames_to_duration(current_frame_count, self.sample_rate);
-            let playback = start_cycle_instant
-                .add(buffer_duration)
-                .expect("`playback` occurs beyond representation supported by `StreamInstant`");
+            let callback = start_callback_instant;
+            // Use next_usecs (the hardware deadline for this cycle) when available; it is the
+            // exact instant at which the last sample written here will be consumed by the device.
+            let playback = match next_usecs_opt {
+                Some(next_usecs) => micros_to_stream_instant(next_usecs),
+                None => {
+                    start_cycle_instant + frames_to_duration(current_frame_count, self.sample_rate)
+                }
+            };
             let timestamp = crate::OutputStreamTimestamp { callback, playback };
             let info = crate::OutputCallbackInfo { timestamp };
             output_callback(&mut data, &info);
@@ -401,9 +403,8 @@ impl jack::ProcessHandler for LocalProcessHandler {
     }
 }
 
-fn micros_to_stream_instant(micros: u64) -> crate::StreamInstant {
-    crate::StreamInstant::from_nanos_i128(micros as i128 * 1_000)
-        .expect("`micros` out of range of `StreamInstant` representation")
+fn micros_to_stream_instant(micros: u64) -> StreamInstant {
+    StreamInstant::from_micros(micros)
 }
 
 // Convert the given duration in frames at the given sample rate to a `std::time::Duration`.
