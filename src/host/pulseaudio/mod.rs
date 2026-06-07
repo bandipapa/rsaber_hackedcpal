@@ -1,3 +1,12 @@
+use std::{
+    ffi::CString,
+    fmt,
+    hash::{Hash, Hasher},
+    mem::discriminant,
+    sync::mpsc,
+    time::Duration,
+};
+
 use futures::executor::block_on;
 use pulseaudio::protocol;
 
@@ -6,13 +15,17 @@ mod stream;
 pub use stream::Stream;
 
 use crate::{
+    error::ResultExt,
     traits::{DeviceTrait, HostTrait},
-    BackendSpecificError, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription,
-    DeviceDescriptionBuilder, DeviceDirection, DeviceId, DeviceIdError, DeviceNameError,
-    DevicesError, FrameCount, HostId, HostUnavailable, InputCallbackInfo, OutputCallbackInfo,
-    SampleFormat, StreamConfig, StreamError, SupportedBufferSize, SupportedStreamConfig,
-    SupportedStreamConfigRange, SupportedStreamConfigsError,
+    BufferSize, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection, DeviceId,
+    Error, ErrorKind, FrameCount, HostId, InputCallbackInfo, OutputCallbackInfo, SampleFormat,
+    SampleRate, StreamConfig, SupportedBufferSize, SupportedStreamConfig,
+    SupportedStreamConfigRange,
 };
+
+const INIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+const MIN_SAMPLE_RATE: SampleRate = 1; // per `pa_sample_spec_valid()`
 
 const PULSE_FORMATS: &[SampleFormat] = &[
     SampleFormat::U8,
@@ -29,7 +42,10 @@ impl TryFrom<protocol::SampleFormat> for SampleFormat {
         match spec {
             protocol::SampleFormat::U8 => Ok(SampleFormat::U8),
             protocol::SampleFormat::S16Le | protocol::SampleFormat::S16Be => Ok(SampleFormat::I16),
-            protocol::SampleFormat::S24Le | protocol::SampleFormat::S24Be => Ok(SampleFormat::I24),
+            protocol::SampleFormat::S24Le
+            | protocol::SampleFormat::S24Be
+            | protocol::SampleFormat::S24In32Le
+            | protocol::SampleFormat::S24In32Be => Ok(SampleFormat::I24),
             protocol::SampleFormat::S32Le | protocol::SampleFormat::S32Be => Ok(SampleFormat::I32),
             protocol::SampleFormat::Float32Le | protocol::SampleFormat::Float32Be => {
                 Ok(SampleFormat::F32)
@@ -47,8 +63,11 @@ impl TryFrom<SampleFormat> for protocol::SampleFormat {
             (SampleFormat::U8, _) => Ok(protocol::SampleFormat::U8),
             (SampleFormat::I16, true) => Ok(protocol::SampleFormat::S16Le),
             (SampleFormat::I16, false) => Ok(protocol::SampleFormat::S16Be),
-            (SampleFormat::I24, true) => Ok(protocol::SampleFormat::S24Le),
-            (SampleFormat::I24, false) => Ok(protocol::SampleFormat::S24Be),
+            // cpal's I24 uses a 4-byte i32 container, matching PulseAudio's
+            // S24_32 format. PA converts from the device's native S24 (3-byte
+            // packed) to S24_32 transparently when the stream format differs.
+            (SampleFormat::I24, true) => Ok(protocol::SampleFormat::S24In32Le),
+            (SampleFormat::I24, false) => Ok(protocol::SampleFormat::S24In32Be),
             (SampleFormat::I32, true) => Ok(protocol::SampleFormat::S32Le),
             (SampleFormat::I32, false) => Ok(protocol::SampleFormat::S32Be),
             (SampleFormat::F32, true) => Ok(protocol::SampleFormat::Float32Le),
@@ -58,10 +77,49 @@ impl TryFrom<SampleFormat> for protocol::SampleFormat {
     }
 }
 
-impl From<pulseaudio::ClientError> for BackendSpecificError {
+impl From<pulseaudio::ClientError> for Error {
     fn from(err: pulseaudio::ClientError) -> Self {
-        BackendSpecificError {
-            description: err.to_string(),
+        use pulseaudio::ClientError::*;
+
+        fn pulse_error_kind(e: protocol::PulseError) -> ErrorKind {
+            use protocol::PulseError::*;
+            match e {
+                AccessDenied | AuthKey => ErrorKind::PermissionDenied,
+                ConnectionRefused | InvalidServer | ModInitFailed => ErrorKind::HostUnavailable,
+                NoEntity => ErrorKind::DeviceNotAvailable,
+                Timeout | Busy => ErrorKind::DeviceBusy,
+                NotSupported | Obsolete | NotImplemented | Version | NoExtension => {
+                    ErrorKind::UnsupportedOperation
+                }
+                Invalid | Command | TooLarge | Exist | Forked => ErrorKind::InvalidInput,
+                ConnectionTerminated | Killed | Protocol | BadState | Io => {
+                    ErrorKind::StreamInvalidated
+                }
+                NoData => ErrorKind::Xrun,
+                _ => ErrorKind::BackendError,
+            }
+        }
+
+        match err {
+            ServerUnavailable => {
+                Error::with_message(ErrorKind::HostUnavailable, "PulseAudio is not available")
+            }
+            UnexpectedSequenceNumber | Disconnected => {
+                Error::with_message(ErrorKind::StreamInvalidated, "PulseAudio disconnected")
+            }
+            Io(e) => Error::with_message(ErrorKind::StreamInvalidated, format!("I/O error: {e}")),
+            ServerError(e) => Error::with_message(pulse_error_kind(e), format!("{e}")),
+            Protocol(e) => {
+                use protocol::ProtocolError::*;
+                let kind = match &e {
+                    UnsupportedVersion(_) | Unimplemented(..) => ErrorKind::UnsupportedOperation,
+                    Invalid(_) => ErrorKind::InvalidInput,
+                    Timeout => ErrorKind::DeviceBusy,
+                    UnexpectedCommand(_) | Io(_) => ErrorKind::StreamInvalidated,
+                    ServerError(e) => pulse_error_kind(*e),
+                };
+                Error::with_message(kind, format!("{e}"))
+            }
         }
     }
 }
@@ -73,9 +131,27 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn new() -> Result<Self, HostUnavailable> {
-        let client =
-            pulseaudio::Client::from_env(c"cpal-pulseaudio").map_err(|_| HostUnavailable)?;
+    pub fn new() -> Result<Self, Error> {
+        // `Client::from_env` does a blocking auth handshake with no socket timeout. If this never
+        // returns, fall through to the next host with no other option than to leak the thread.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let name = CString::new(format!("cpal-pulseaudio-{}", std::process::id())).unwrap();
+            let _ = tx.send(pulseaudio::Client::from_env(&name));
+        });
+        let client = rx
+            .recv_timeout(INIT_TIMEOUT)
+            .map_err(|err| match err {
+                mpsc::RecvTimeoutError::Timeout => Error::with_message(
+                    ErrorKind::HostUnavailable,
+                    "PulseAudio is not available: connection timed out",
+                ),
+                mpsc::RecvTimeoutError::Disconnected => Error::with_message(
+                    ErrorKind::HostUnavailable,
+                    "PulseAudio is not available: initialization failed",
+                ),
+            })
+            .and_then(|r| r.map_err(Error::from))?;
 
         Ok(Self { client })
     }
@@ -89,14 +165,10 @@ impl HostTrait for Host {
         pulseaudio::socket_path_from_env().is_some()
     }
 
-    fn devices(&self) -> Result<Self::Devices, DevicesError> {
-        let sinks = block_on(self.client.list_sinks()).map_err(|err| BackendSpecificError {
-            description: format!("Failed to list sinks: {err}"),
-        })?;
+    fn devices(&self) -> Result<Self::Devices, Error> {
+        let sinks = block_on(self.client.list_sinks()).context("Failed to list sinks")?;
 
-        let sources = block_on(self.client.list_sources()).map_err(|err| BackendSpecificError {
-            description: format!("Failed to list sources: {err}"),
-        })?;
+        let sources = block_on(self.client.list_sources()).context("Failed to list sources")?;
 
         Ok(sinks
             .into_iter()
@@ -152,18 +224,21 @@ pub enum Device {
     },
 }
 
-fn supported_config_ranges() -> Vec<SupportedStreamConfigRange> {
+fn supported_config_ranges(is_playback: bool) -> Vec<SupportedStreamConfigRange> {
     let mut ranges = vec![];
     for format in PULSE_FORMATS {
         for channel_count in 1..protocol::sample_spec::MAX_CHANNELS {
             let bytes_per_frame = channel_count as usize * format.sample_size();
-            let max_frames = (protocol::MAX_MEMBLOCKQ_LENGTH / bytes_per_frame) as FrameCount;
+            // Playback uses a double-buffer.
+            let divisor = if is_playback { 2 } else { 1 };
+            let max_frames =
+                (protocol::MAX_MEMBLOCKQ_LENGTH / (divisor * bytes_per_frame)) as FrameCount;
             ranges.push(SupportedStreamConfigRange {
                 channels: channel_count as _,
-                min_sample_rate: 1,
+                min_sample_rate: MIN_SAMPLE_RATE,
                 max_sample_rate: protocol::sample_spec::MAX_RATE,
                 buffer_size: SupportedBufferSize::Range {
-                    min: 0,
+                    min: 1,
                     max: max_frames,
                 },
                 sample_format: *format,
@@ -176,18 +251,22 @@ fn supported_config_ranges() -> Vec<SupportedStreamConfigRange> {
 fn default_config_from_spec(
     sample_spec: &protocol::SampleSpec,
     channel_map: &protocol::ChannelMap,
-) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-    let sample_format: SampleFormat = sample_spec
-        .format
-        .try_into()
-        .map_err(|_| DefaultStreamConfigError::StreamTypeNotSupported)?;
+    is_playback: bool,
+) -> Result<SupportedStreamConfig, Error> {
+    let sample_format: SampleFormat = sample_spec.format.try_into().map_err(|_| {
+        Error::with_message(
+            ErrorKind::UnsupportedConfig,
+            "Sample format is not supported",
+        )
+    })?;
     let bytes_per_frame = channel_map.num_channels() as usize * sample_format.sample_size();
-    let max_frames = (protocol::MAX_MEMBLOCKQ_LENGTH / bytes_per_frame) as u32;
+    let divisor = if is_playback { 2 } else { 1 };
+    let max_frames = (protocol::MAX_MEMBLOCKQ_LENGTH / (divisor * bytes_per_frame)) as u32;
     Ok(SupportedStreamConfig {
         channels: channel_map.num_channels() as _,
         sample_rate: sample_spec.sample_rate,
         buffer_size: SupportedBufferSize::Range {
-            min: 0,
+            min: 1,
             max: max_frames,
         },
         sample_format,
@@ -199,45 +278,38 @@ impl DeviceTrait for Device {
     type SupportedOutputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>;
     type Stream = Stream;
 
-    fn name(&self) -> Result<String, DeviceNameError> {
-        let name = match self {
-            Device::Sink { info, .. } => &info.name,
-            Device::Source { info, .. } => &info.name,
-        };
-
-        Ok(String::from_utf8_lossy(name.as_bytes()).into_owned())
-    }
-
-    fn supported_input_configs(
-        &self,
-    ) -> Result<Self::SupportedInputConfigs, SupportedStreamConfigsError> {
+    fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
         let Device::Source { .. } = self else {
             return Ok(vec![].into_iter());
         };
-        Ok(supported_config_ranges().into_iter())
+        Ok(supported_config_ranges(false).into_iter())
     }
 
-    fn supported_output_configs(
-        &self,
-    ) -> Result<Self::SupportedOutputConfigs, SupportedStreamConfigsError> {
+    fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
         let Device::Sink { .. } = self else {
             return Ok(vec![].into_iter());
         };
-        Ok(supported_config_ranges().into_iter())
+        Ok(supported_config_ranges(true).into_iter())
     }
 
-    fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
         let Device::Source { info, .. } = self else {
-            return Err(DefaultStreamConfigError::StreamTypeNotSupported);
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "Device does not support input",
+            ));
         };
-        default_config_from_spec(&info.sample_spec, &info.channel_map)
+        default_config_from_spec(&info.sample_spec, &info.channel_map, false)
     }
 
-    fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
         let Device::Sink { info, .. } = self else {
-            return Err(DefaultStreamConfigError::StreamTypeNotSupported);
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "Device does not support output",
+            ));
         };
-        default_config_from_spec(&info.sample_spec, &info.channel_map)
+        default_config_from_spec(&info.sample_spec, &info.channel_map, true)
     }
 
     fn build_input_stream_raw<D, E>(
@@ -246,24 +318,45 @@ impl DeviceTrait for Device {
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
-        _timeout: Option<std::time::Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+        timeout: Option<Duration>,
+    ) -> Result<Self::Stream, Error>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         let Device::Source { client, info } = self else {
-            return Err(BuildStreamError::StreamConfigNotSupported);
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "Device does not support input",
+            ));
         };
 
-        let format: protocol::SampleFormat = sample_format
-            .try_into()
-            .map_err(|_| BuildStreamError::StreamConfigNotSupported)?;
+        crate::validate_stream_config(&config)?;
+
+        let format: protocol::SampleFormat = sample_format.try_into().map_err(|_| {
+            Error::with_message(
+                ErrorKind::UnsupportedConfig,
+                format!("Sample format {sample_format} is not supported"),
+            )
+        })?;
+
+        if let BufferSize::Fixed(frame_count) = config.buffer_size {
+            let bytes_per_frame = config.channels as usize * sample_format.sample_size();
+            let max_frames = (protocol::MAX_MEMBLOCKQ_LENGTH / bytes_per_frame) as FrameCount;
+            if !(1..=max_frames).contains(&frame_count) {
+                return Err(Error::with_message(
+                    ErrorKind::UnsupportedConfig,
+                    format!(
+                        "Buffer size {frame_count} is not in the supported range 1..={max_frames}"
+                    ),
+                ));
+            }
+        }
 
         let sample_spec = make_sample_spec(config, format);
         let channel_map = make_channel_map(config);
         let buffer_attr = make_record_buffer_attr(config, format);
-        let adjust_latency = matches!(config.buffer_size, crate::BufferSize::Fixed(_));
+        let adjust_latency = matches!(config.buffer_size, BufferSize::Fixed(_));
 
         let params = protocol::RecordStreamParams {
             sample_spec,
@@ -281,7 +374,32 @@ impl DeviceTrait for Device {
             ..Default::default()
         };
 
-        stream::Stream::new_record(client.clone(), params, data_callback, error_callback)
+        let client = client.clone();
+        let stream = if let Some(dur) = timeout {
+            // Run stream creation on a thread so we can bound the wait. If the PulseAudio server
+            // is hung, `create_record_stream` would block forever.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(stream::Stream::new_record(
+                    client,
+                    params,
+                    data_callback,
+                    error_callback,
+                ))
+                .ok();
+            });
+            match rx.recv_timeout(dur) {
+                Ok(result) => result,
+                Err(_) => Err(Error::with_message(
+                    ErrorKind::DeviceNotAvailable,
+                    "Stream creation timed out",
+                )),
+            }
+        } else {
+            stream::Stream::new_record(client, params, data_callback, error_callback)
+        }?;
+        stream.signal_ready();
+        Ok(stream)
     }
 
     fn build_output_stream_raw<D, E>(
@@ -290,24 +408,47 @@ impl DeviceTrait for Device {
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
-        _timeout: Option<std::time::Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+        timeout: Option<Duration>,
+    ) -> Result<Self::Stream, Error>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         let Device::Sink { client, info } = self else {
-            return Err(BuildStreamError::StreamConfigNotSupported);
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "Device does not support output",
+            ));
         };
 
-        let format: protocol::SampleFormat = sample_format
-            .try_into()
-            .map_err(|_| BuildStreamError::StreamConfigNotSupported)?;
+        crate::validate_stream_config(&config)?;
+
+        let format: protocol::SampleFormat = sample_format.try_into().map_err(|_| {
+            Error::with_message(
+                ErrorKind::UnsupportedConfig,
+                format!("Sample format {sample_format} is not supported"),
+            )
+        })?;
+
+        if let BufferSize::Fixed(frame_count) = config.buffer_size {
+            let bytes_per_frame = config.channels as usize * sample_format.sample_size();
+            // Playback uses a double-buffer (max_length = 2 × frame_count × bytes_per_frame),
+            // so the max period that fits in MAX_MEMBLOCKQ_LENGTH is halved.
+            let max_frames = (protocol::MAX_MEMBLOCKQ_LENGTH / (2 * bytes_per_frame)) as FrameCount;
+            if !(1..=max_frames).contains(&frame_count) {
+                return Err(Error::with_message(
+                    ErrorKind::UnsupportedConfig,
+                    format!(
+                        "Buffer size {frame_count} is not in the supported range 1..={max_frames}"
+                    ),
+                ));
+            }
+        }
 
         let sample_spec = make_sample_spec(config, format);
         let channel_map = make_channel_map(config);
         let buffer_attr = make_playback_buffer_attr(config, format);
-        let adjust_latency = matches!(config.buffer_size, crate::BufferSize::Fixed(_));
+        let adjust_latency = matches!(config.buffer_size, BufferSize::Fixed(_));
 
         let params = protocol::PlaybackStreamParams {
             sink_index: Some(info.index),
@@ -325,31 +466,57 @@ impl DeviceTrait for Device {
             ..Default::default()
         };
 
-        stream::Stream::new_playback(client.clone(), params, data_callback, error_callback)
+        let client = client.clone();
+        let stream = if let Some(dur) = timeout {
+            // Run stream creation on a thread so we can bound the wait. If the PulseAudio server
+            // is hung, `create_playback_stream` would block forever.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(stream::Stream::new_playback(
+                    client,
+                    params,
+                    data_callback,
+                    error_callback,
+                ))
+                .ok();
+            });
+            match rx.recv_timeout(dur) {
+                Ok(result) => result,
+                Err(_) => Err(Error::with_message(
+                    ErrorKind::DeviceNotAvailable,
+                    "Stream creation timed out",
+                )),
+            }
+        } else {
+            stream::Stream::new_playback(client, params, data_callback, error_callback)
+        }?;
+        stream.signal_ready();
+        Ok(stream)
     }
 
-    fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
+    fn description(&self) -> Result<DeviceDescription, Error> {
         let (name, description, direction) = match self {
             Device::Sink { info, .. } => (&info.name, &info.description, DeviceDirection::Output),
             Device::Source { info, .. } => (&info.name, &info.description, DeviceDirection::Input),
         };
 
-        let mut builder = DeviceDescriptionBuilder::new(String::from_utf8_lossy(name.as_bytes()))
-            .direction(direction);
-        if let Some(desc) = description {
-            builder = builder.add_extended_line(String::from_utf8_lossy(desc.as_bytes()));
-        }
+        let display_name = String::from_utf8_lossy(description.as_ref().unwrap_or(name).as_bytes());
 
-        Ok(builder.build())
+        Ok(DeviceDescriptionBuilder::new(display_name)
+            .direction(direction)
+            .build())
     }
 
-    fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        let id = match self {
-            Device::Sink { info, .. } => info.index,
-            Device::Source { info, .. } => info.index,
+    fn id(&self) -> Result<DeviceId, Error> {
+        let name = match self {
+            Device::Sink { info, .. } => &info.name,
+            Device::Source { info, .. } => &info.name,
         };
 
-        Ok(DeviceId(HostId::PulseAudio, id.to_string()))
+        Ok(DeviceId::new(
+            HostId::PulseAudio,
+            String::from_utf8_lossy(name.as_bytes()),
+        ))
     }
 }
 
@@ -442,16 +609,19 @@ fn make_playback_buffer_attr(
     format: protocol::SampleFormat,
 ) -> protocol::stream::BufferAttr {
     match config.buffer_size {
-        crate::BufferSize::Default => Default::default(),
-        crate::BufferSize::Fixed(frame_count) => {
-            let len = frame_count * config.channels as u32 * format.bytes_per_sample() as u32;
+        BufferSize::Default => Default::default(),
+        BufferSize::Fixed(frame_count) => {
+            let len =
+                (frame_count as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
+                    .min(u32::MAX as u64) as u32;
+            let double_len = (len as u64 * 2).min(u32::MAX as u64) as u32;
             protocol::stream::BufferAttr {
                 // Double-buffer: total buffer = 2 callback periods. With
                 // adjust_latency this becomes the end-to-end latency target,
                 // Minimum request = one callback period, ensuring the server
                 // always asks for exactly frame_count frames per call.
-                max_length: 2 * len,
-                target_length: 2 * len,
+                max_length: double_len,
+                target_length: double_len,
                 minimum_request_length: len,
                 ..Default::default()
             }
@@ -464,9 +634,11 @@ fn make_record_buffer_attr(
     format: protocol::SampleFormat,
 ) -> protocol::stream::BufferAttr {
     match config.buffer_size {
-        crate::BufferSize::Default => Default::default(),
-        crate::BufferSize::Fixed(frame_count) => {
-            let len = frame_count * config.channels as u32 * format.bytes_per_sample() as u32;
+        BufferSize::Default => Default::default(),
+        BufferSize::Fixed(frame_count) => {
+            let len =
+                (frame_count as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
+                    .min(u32::MAX as u64) as u32;
             protocol::stream::BufferAttr {
                 // fragment_size controls the delivery chunk size for record
                 // streams; target_length is playback-only and is ignored here.
@@ -474,6 +646,35 @@ fn make_record_buffer_attr(
                 fragment_size: len,
                 ..Default::default()
             }
+        }
+    }
+}
+
+impl PartialEq for Device {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Device::Sink { info: a, .. }, Device::Sink { info: b, .. }) => a.name == b.name,
+            (Device::Source { info: a, .. }, Device::Source { info: b, .. }) => a.name == b.name,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Device {}
+
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let desc = self.description().map_err(|_| fmt::Error)?;
+        f.write_str(desc.name())
+    }
+}
+
+impl Hash for Device {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        discriminant(self).hash(state);
+        match self {
+            Device::Sink { info, .. } => info.name.hash(state),
+            Device::Source { info, .. } => info.name.hash(state),
         }
     }
 }

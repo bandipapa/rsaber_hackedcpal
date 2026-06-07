@@ -1,30 +1,55 @@
-use std::sync::{atomic::AtomicU64, Arc};
-use std::time::Duration;
-use std::{cell::RefCell, rc::Rc};
-use std::sync::atomic::Ordering;
-
-use crate::host::pipewire::stream::{StreamCommand, StreamData, SUPPORTED_FORMATS};
-use crate::host::pipewire::utils::{audio, clock, DEVICE_ICON_NAME, METADATA_NAME};
-use crate::{traits::DeviceTrait, DeviceDirection, SupportedStreamConfigRange};
-use crate::{ChannelCount, FrameCount, InterfaceType, SampleRate};
-
-use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
-use pipewire::{
-    self as pw,
-    metadata::{Metadata, MetadataListener},
-    node::{Node, NodeListener},
-    proxy::ProxyT,
-    spa::utils::result::AsyncSeq,
+use std::{
+    cell::RefCell,
+    fmt,
+    hash::{Hash, Hasher},
+    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+    time::Duration,
 };
 
-use std::thread;
+use pipewire::{
+    self as pw,
+    context::ContextRc,
+    core::PW_ID_CORE,
+    main_loop::MainLoopRc,
+    metadata::{Metadata, MetadataListener},
+    node::{Node, NodeListener},
+    properties::PropertiesBox,
+    proxy::ProxyT,
+    spa::utils::result::AsyncSeq,
+    types::ObjectType,
+};
 
 use super::stream::Stream;
+use crate::{
+    host::{
+        emit_error,
+        latch::Latch,
+        pipewire::{
+            stream::{
+                DefaultDeviceMonitor, PwInitGuard, StreamCommand, StreamData, SUPPORTED_FORMATS,
+            },
+            utils::{audio, clock, default, node, DEVICE_ICON_NAME, METADATA_NAME},
+        },
+    },
+    iter::{SupportedInputConfigs, SupportedOutputConfigs},
+    traits::DeviceTrait,
+    BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection,
+    DeviceId, DeviceType, Error, ErrorKind, FrameCount, HostId, InputCallbackInfo, InterfaceType,
+    OutputCallbackInfo, SampleFormat, SampleRate, StreamConfig, SupportedBufferSize,
+    SupportedStreamConfig, SupportedStreamConfigRange,
+};
 
 use atomic::Atomic;
 use super::stream::StreamPos;
 
 pub type Devices = std::vec::IntoIter<Device>;
+
+const INIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 // This enum record whether it is created by human or just default device
 #[derive(Clone, Debug, Default, Copy)]
@@ -37,9 +62,9 @@ pub(crate) enum Class {
 }
 
 #[derive(Clone, Debug, Default, Copy)]
-pub enum Role {
-    Sink,
+enum Role {
     #[default]
+    Sink,
     Source,
     Duplex,
     StreamOutput,
@@ -54,7 +79,7 @@ pub struct Device {
     direction: DeviceDirection,
     channels: ChannelCount,
     rate: SampleRate,
-    allow_rates: Vec<SampleRate>,
+    allow_rates: Arc<[SampleRate]>,
     quantum: FrameCount,
     min_quantum: FrameCount,
     max_quantum: FrameCount,
@@ -65,12 +90,14 @@ pub struct Device {
     interface_type: InterfaceType,
     address: Option<String>,
     driver: Option<String>,
+    connect_automatically: Arc<AtomicBool>,
 }
 
 impl Device {
     pub(crate) fn class(&self) -> Class {
         self.class
     }
+
     fn sink_default() -> Self {
         Self {
             node_name: "sink_default".to_owned(),
@@ -103,26 +130,36 @@ impl Device {
             direction: DeviceDirection::Output,
             channels: 2,
             class: Class::DefaultOutput,
-            role: Role::Source,
+            role: Role::Sink,
             ..Default::default()
         }
     }
 
-    fn device_type(&self) -> crate::DeviceType {
+    fn device_type(&self) -> DeviceType {
         match self.icon_name.as_str() {
-            "audio-headphones" => crate::DeviceType::Headphones,
-            "audio-headset" => crate::DeviceType::Headset,
-            "audio-input-microphone" => crate::DeviceType::Microphone,
-            "audio-speakers" => crate::DeviceType::Speaker,
-            _ => crate::DeviceType::Unknown,
+            "audio-headphones" => DeviceType::Headphones,
+            "audio-headset" => DeviceType::Headset,
+            "audio-input-microphone" => DeviceType::Microphone,
+            "audio-speakers" => DeviceType::Speaker,
+            _ => DeviceType::Unknown,
+        }
+    }
+
+    /// Returns the WirePlumber metadata key to watch for default-device changes,
+    /// or `None` if this device is pinned to a specific node.
+    pub(crate) fn default_metadata_key(&self) -> Option<&'static str> {
+        match self.class {
+            Class::DefaultOutput | Class::DefaultSink => Some(default::SINK),
+            Class::DefaultInput => Some(default::SOURCE),
+            Class::Node => None,
         }
     }
 
     pub(crate) fn pw_properties(
         &self,
         direction: DeviceDirection,
-        config: &crate::StreamConfig,
-    ) -> pw::properties::PropertiesBox {
+        config: &StreamConfig,
+    ) -> PropertiesBox {
         let mut properties = match direction {
             DeviceDirection::Output => pw::properties::properties! {
                 *pw::keys::MEDIA_TYPE => "Audio",
@@ -134,32 +171,59 @@ impl Device {
             },
             _ => unreachable!(),
         };
-        if matches!(self.role, Role::Sink) {
+        if matches!(self.role, Role::Sink) && matches!(direction, DeviceDirection::Input) {
             properties.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
         }
         if matches!(self.class, Class::Node) {
             properties.insert(*pw::keys::TARGET_OBJECT, self.object_serial.to_string());
         }
-        if let crate::BufferSize::Fixed(buffer_size) = config.buffer_size {
-            properties.insert(*pw::keys::NODE_FORCE_QUANTUM, buffer_size.to_string());
+
+        // Group input and output nodes so PipeWire schedules them in the same quantum,
+        // preventing phase drift between simultaneous input/output streams.
+        properties.insert("node.group", format!("cpal-{}", std::process::id()));
+
+        if let BufferSize::Fixed(buffer_size) = config.buffer_size {
+            properties.insert(
+                *pw::keys::NODE_LATENCY,
+                format!("{buffer_size}/{rate}", rate = config.sample_rate),
+            );
         }
         properties
     }
 }
+
+impl PartialEq for Device {
+    fn eq(&self, other: &Self) -> bool {
+        self.node_name == other.node_name
+    }
+}
+
+impl Eq for Device {}
+
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let desc = self.description().map_err(|_| fmt::Error)?;
+        f.write_str(desc.name())
+    }
+}
+
+impl Hash for Device {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.node_name.hash(state);
+    }
+}
+
 impl DeviceTrait for Device {
     type Stream = Stream;
     type SupportedInputConfigs = SupportedInputConfigs;
     type SupportedOutputConfigs = SupportedOutputConfigs;
 
-    fn id(&self) -> Result<crate::DeviceId, crate::DeviceIdError> {
-        Ok(crate::DeviceId(
-            crate::HostId::PipeWire,
-            self.node_name.clone(),
-        ))
+    fn id(&self) -> Result<DeviceId, Error> {
+        Ok(DeviceId::new(HostId::PipeWire, &self.node_name))
     }
 
-    fn description(&self) -> Result<crate::DeviceDescription, crate::DeviceNameError> {
-        let mut builder = crate::DeviceDescriptionBuilder::new(&self.nick_name)
+    fn description(&self) -> Result<DeviceDescription, Error> {
+        let mut builder = DeviceDescriptionBuilder::new(&self.nick_name)
             .direction(self.direction)
             .device_type(self.device_type())
             .interface_type(self.interface_type);
@@ -189,16 +253,14 @@ impl DeviceTrait for Device {
         )
     }
 
-    fn supported_input_configs(
-        &self,
-    ) -> Result<Self::SupportedInputConfigs, crate::SupportedStreamConfigsError> {
+    fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
         if !self.supports_input() {
             return Ok(vec![].into_iter());
         }
-        let rates = if self.allow_rates.is_empty() {
-            vec![self.rate]
+        let rates: &[SampleRate] = if self.allow_rates.is_empty() {
+            &[self.rate]
         } else {
-            self.allow_rates.clone()
+            &self.allow_rates
         };
         Ok(rates
             .iter()
@@ -209,7 +271,7 @@ impl DeviceTrait for Device {
                         channels: self.channels,
                         min_sample_rate: rate,
                         max_sample_rate: rate,
-                        buffer_size: crate::SupportedBufferSize::Range {
+                        buffer_size: SupportedBufferSize::Range {
                             min: self.min_quantum,
                             max: self.max_quantum,
                         },
@@ -219,16 +281,14 @@ impl DeviceTrait for Device {
             .collect::<Vec<_>>()
             .into_iter())
     }
-    fn supported_output_configs(
-        &self,
-    ) -> Result<Self::SupportedOutputConfigs, crate::SupportedStreamConfigsError> {
+    fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
         if !self.supports_output() {
             return Ok(vec![].into_iter());
         }
-        let rates = if self.allow_rates.is_empty() {
-            vec![self.rate]
+        let rates: &[SampleRate] = if self.allow_rates.is_empty() {
+            &[self.rate]
         } else {
-            self.allow_rates.clone()
+            &self.allow_rates
         };
         Ok(rates
             .iter()
@@ -239,7 +299,7 @@ impl DeviceTrait for Device {
                         channels: self.channels,
                         min_sample_rate: rate,
                         max_sample_rate: rate,
-                        buffer_size: crate::SupportedBufferSize::Range {
+                        buffer_size: SupportedBufferSize::Range {
                             min: self.min_quantum,
                             max: self.max_quantum,
                         },
@@ -249,34 +309,36 @@ impl DeviceTrait for Device {
             .collect::<Vec<_>>()
             .into_iter())
     }
-    fn default_input_config(
-        &self,
-    ) -> Result<crate::SupportedStreamConfig, crate::DefaultStreamConfigError> {
+    fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
         if !self.supports_input() {
-            return Err(crate::DefaultStreamConfigError::StreamTypeNotSupported);
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "Device does not support input",
+            ));
         }
-        Ok(crate::SupportedStreamConfig {
+        Ok(SupportedStreamConfig {
             channels: self.channels,
-            sample_format: crate::SampleFormat::F32,
+            sample_format: SampleFormat::F32,
             sample_rate: self.rate,
-            buffer_size: crate::SupportedBufferSize::Range {
+            buffer_size: SupportedBufferSize::Range {
                 min: self.min_quantum,
                 max: self.max_quantum,
             },
         })
     }
 
-    fn default_output_config(
-        &self,
-    ) -> Result<crate::SupportedStreamConfig, crate::DefaultStreamConfigError> {
+    fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
         if !self.supports_output() {
-            return Err(crate::DefaultStreamConfigError::StreamTypeNotSupported);
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "Device does not support output",
+            ));
         }
-        Ok(crate::SupportedStreamConfig {
+        Ok(SupportedStreamConfig {
             channels: self.channels,
-            sample_format: crate::SampleFormat::F32,
+            sample_format: SampleFormat::F32,
             sample_rate: self.rate,
-            buffer_size: crate::SupportedBufferSize::Range {
+            buffer_size: SupportedBufferSize::Range {
                 min: self.min_quantum,
                 max: self.max_quantum,
             },
@@ -285,24 +347,40 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        config: crate::StreamConfig,
-        sample_format: crate::SampleFormat,
+        config: StreamConfig,
+        sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
         timeout: Option<std::time::Duration>,
-    ) -> Result<Self::Stream, crate::BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
-        D: FnMut(&crate::Data, &crate::InputCallbackInfo) + Send + 'static,
-        E: FnMut(crate::StreamError) + Send + 'static,
+        D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
+        crate::validate_stream_config(&config)?;
+        if let BufferSize::Fixed(n) = config.buffer_size {
+            // When max_quantum is 0 the server clock metadata has not been received yet.
+            if self.max_quantum > 0 && !(self.min_quantum..=self.max_quantum).contains(&n) {
+                return Err(Error::with_message(
+                    ErrorKind::UnsupportedConfig,
+                    format!(
+                        "Buffer size {n} is not in the supported quantum range {min}..={max}",
+                        min = self.min_quantum,
+                        max = self.max_quantum
+                    ),
+                ));
+            }
+        }
         let (pw_play_tx, pw_play_rx) = pw::channel::channel::<StreamCommand>();
 
-        let (pw_init_tx, pw_init_rx) = std::sync::mpsc::channel::<bool>();
+        let (init_tx, init_rx) = mpsc::channel::<Result<(), Error>>();
+        let mut latch = Latch::new();
+        let waiter = latch.waiter();
         let device = self.clone();
         let wait_timeout = timeout.unwrap_or(Duration::from_secs(2));
         let initial_quantum = match config.buffer_size {
-            crate::BufferSize::Fixed(n) => n as u64,
-            crate::BufferSize::Default => self.quantum as u64,
+            BufferSize::Fixed(n) => n as u64,
+            BufferSize::Default => self.quantum as u64,
         };
         let last_quantum = Arc::new(AtomicU64::new(initial_quantum));
         let last_quantum_clone = last_quantum.clone();
@@ -310,86 +388,179 @@ impl DeviceTrait for Device {
         let pos = Arc::new(Atomic::new(StreamPos::default()));
         let pos_clone = Arc::clone(&pos);
 
+        let start = std::time::Instant::now();
         let handle = thread::Builder::new()
             .name("pw_in".to_owned())
             .spawn(move || {
+                let _pw = PwInitGuard::new();
                 let properties = device.pw_properties(DeviceDirection::Input, &config);
-                let Ok(StreamData {
+
+                let stream_data = match super::stream::connect_input(
+                    super::stream::ConnectParams {
+                        config,
+                        properties,
+                        sample_format,
+                        last_quantum: last_quantum_clone,
+                        start,
+                        connect_automatically: device.connect_automatically.load(Ordering::Relaxed),
+                    },
+                    data_callback,
+                    error_callback,
+                    Arc::clone(&pos_clone),
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(Error::with_message(
+                            ErrorKind::UnsupportedConfig,
+                            format!("PipeWire stream connection failed: {e}"),
+                        )));
+                        return;
+                    }
+                };
+
+                let StreamData {
                     mainloop,
                     listener,
                     stream,
                     context,
-                }) = super::stream::connect_input(
-                    config,
-                    properties,
-                    sample_format,
-                    data_callback,
+                    core,
+                    core_monitor,
                     error_callback,
-                    last_quantum_clone,
-                    Arc::clone(&pos_clone),
-                )
-                else {
-                    let _ = pw_init_tx.send(false);
-                    return;
+                    pending_device_changed,
+                    invalidated,
+                    is_default_device,
+                } = stream_data;
+
+                let default_monitor = if let Some(key) = device.default_metadata_key() {
+                    match core.get_registry_rc() {
+                        Ok(registry) => Some(DefaultDeviceMonitor::new(
+                            registry,
+                            key,
+                            error_callback.clone(),
+                            invalidated,
+                            pending_device_changed,
+                        )),
+                        Err(e) => {
+                            let _ = init_tx.send(Err(Error::with_message(
+                                ErrorKind::BackendError,
+                                format!("PipeWire: could not acquire registry: {e}"),
+                            )));
+                            return;
+                        }
+                    }
+                } else {
+                    None
                 };
-                let _ = pw_init_tx.send(true);
-                let stream = stream.clone();
+                is_default_device.store(default_monitor.is_some(), Ordering::Relaxed);
+                let stream_clone = stream.clone();
                 let mainloop_rc1 = mainloop.clone();
+                let error_callback_cmd = error_callback.clone();
                 let _receiver = pw_play_rx.attach(mainloop.loop_(), move |play| match play {
                     StreamCommand::Toggle(state) => {
-                        let _ = stream.set_active(state);
+                        if let Err(e) = stream_clone.set_active(state) {
+                            emit_error(
+                                &error_callback_cmd,
+                                Error::with_message(
+                                    ErrorKind::StreamInvalidated,
+                                    format!("PipeWire: set_active({state}) failed: {e}"),
+                                ),
+                            );
+                        }
+
                         set_active_stream_pos(Arc::clone(&pos_clone), state);
                     }
                     StreamCommand::Stop => {
-                        let _ = stream.disconnect();
+                        if let Err(e) = stream_clone.disconnect() {
+                            emit_error(
+                                &error_callback_cmd,
+                                Error::with_message(
+                                    ErrorKind::StreamInvalidated,
+                                    format!("PipeWire: stream disconnect failed: {e}"),
+                                ),
+                            );
+                        }
                         mainloop_rc1.quit();
                     }
                 });
+
+                if init_tx.send(Ok(())).is_err() {
+                    return;
+                }
+
+                // If the Latch is dropped without being released (error path), exit cleanly.
+                if !waiter.wait() {
+                    return;
+                }
+
                 mainloop.run();
+
                 drop(listener);
+                drop(default_monitor);
+                drop(core_monitor);
+                drop(core);
                 drop(context);
             })
-            .map_err(|e| crate::BuildStreamError::BackendSpecific {
-                err: crate::BackendSpecificError {
-                    description: format!("failed to create thread: {e}"),
-                },
+            .map_err(|e| {
+                Error::with_message(
+                    ErrorKind::ResourceExhausted,
+                    format!("Failed to create thread: {e}"),
+                )
             })?;
-        match pw_init_rx.recv_timeout(wait_timeout) {
-            Ok(true) => Ok(Stream {
-                handle: Some(handle),
-                controller: pw_play_tx,
-                last_quantum,
-                pos,
-            }),
-            Ok(false) => Err(crate::BuildStreamError::StreamConfigNotSupported),
-            Err(_) => Err(crate::BuildStreamError::BackendSpecific {
-                err: crate::BackendSpecificError {
-                    description: "pipewire timeout".to_owned(),
-                },
-            }),
+
+        let init_result = init_rx.recv_timeout(wait_timeout).unwrap_or_else(|_| {
+            Err(Error::with_message(
+                ErrorKind::DeviceNotAvailable,
+                "PipeWire timed out",
+            ))
+        });
+
+        if let Err(e) = init_result {
+            drop(latch);
+            return Err(e);
         }
+
+        latch.add_thread(handle.thread().clone());
+        let stream = Stream::new(handle, pw_play_tx, last_quantum, start, latch, pos);
+        stream.signal_ready();
+        Ok(stream)
     }
 
     fn build_output_stream_raw<D, E>(
         &self,
-        config: crate::StreamConfig,
-        sample_format: crate::SampleFormat,
+        config: StreamConfig,
+        sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
         timeout: Option<std::time::Duration>,
-    ) -> Result<Self::Stream, crate::BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
-        D: FnMut(&mut crate::Data, &crate::OutputCallbackInfo) + Send + 'static,
-        E: FnMut(crate::StreamError) + Send + 'static,
+        D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
+        crate::validate_stream_config(&config)?;
+        if let BufferSize::Fixed(n) = config.buffer_size {
+            // When max_quantum is 0 the server clock metadata has not been received yet.
+            if self.max_quantum > 0 && !(self.min_quantum..=self.max_quantum).contains(&n) {
+                return Err(Error::with_message(
+                    ErrorKind::UnsupportedConfig,
+                    format!(
+                        "Buffer size {n} is not in the supported quantum range {min}..={max}",
+                        min = self.min_quantum,
+                        max = self.max_quantum
+                    ),
+                ));
+            }
+        }
         let (pw_play_tx, pw_play_rx) = pw::channel::channel::<StreamCommand>();
 
-        let (pw_init_tx, pw_init_rx) = std::sync::mpsc::channel::<bool>();
+        let (init_tx, init_rx) = mpsc::channel::<Result<(), Error>>();
+        let mut latch = Latch::new();
+        let waiter = latch.waiter();
         let device = self.clone();
         let wait_timeout = timeout.unwrap_or(Duration::from_secs(2));
         let initial_quantum = match config.buffer_size {
-            crate::BufferSize::Fixed(n) => n as u64,
-            crate::BufferSize::Default => self.quantum as u64,
+            BufferSize::Fixed(n) => n as u64,
+            BufferSize::Default => self.quantum as u64,
         };
         let last_quantum = Arc::new(AtomicU64::new(initial_quantum));
         let last_quantum_clone = last_quantum.clone();
@@ -397,66 +568,140 @@ impl DeviceTrait for Device {
         let pos = Arc::new(Atomic::new(StreamPos::default()));
         let pos_clone = Arc::clone(&pos);
 
+        let start = std::time::Instant::now();
         let handle = thread::Builder::new()
             .name("pw_out".to_owned())
             .spawn(move || {
+                let _pw = PwInitGuard::new();
                 let properties = device.pw_properties(DeviceDirection::Output, &config);
 
-                let Ok(StreamData {
+                let stream_data = match super::stream::connect_output(
+                    super::stream::ConnectParams {
+                        config,
+                        properties,
+                        sample_format,
+                        last_quantum: last_quantum_clone,
+                        start,
+                        connect_automatically: device.connect_automatically.load(Ordering::Relaxed),
+                    },
+                    data_callback,
+                    error_callback,
+                    Arc::clone(&pos_clone),
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(Error::with_message(
+                            ErrorKind::UnsupportedConfig,
+                            format!("PipeWire stream connection failed: {e}"),
+                        )));
+                        return;
+                    }
+                };
+
+                let StreamData {
                     mainloop,
                     listener,
                     stream,
                     context,
-                }) = super::stream::connect_output(
-                    config,
-                    properties,
-                    sample_format,
-                    data_callback,
+                    core,
+                    core_monitor,
                     error_callback,
-                    last_quantum_clone,
-                    Arc::clone(&pos_clone),
-                )
-                else {
-                    let _ = pw_init_tx.send(false);
-                    return;
-                };
+                    pending_device_changed,
+                    invalidated,
+                    is_default_device,
+                } = stream_data;
 
-                let _ = pw_init_tx.send(true);
-                let stream = stream.clone();
+                let default_monitor = if let Some(key) = device.default_metadata_key() {
+                    match core.get_registry_rc() {
+                        Ok(registry) => Some(DefaultDeviceMonitor::new(
+                            registry,
+                            key,
+                            error_callback.clone(),
+                            invalidated,
+                            pending_device_changed,
+                        )),
+                        Err(e) => {
+                            let _ = init_tx.send(Err(Error::with_message(
+                                ErrorKind::BackendError,
+                                format!("PipeWire: could not acquire registry: {e}"),
+                            )));
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                is_default_device.store(default_monitor.is_some(), Ordering::Relaxed);
+                let stream_clone = stream.clone();
                 let mainloop_rc1 = mainloop.clone();
+                let error_callback_cmd = error_callback.clone();
                 let _receiver = pw_play_rx.attach(mainloop.loop_(), move |play| match play {
                     StreamCommand::Toggle(state) => {
-                        let _ = stream.set_active(state);
+                        if let Err(e) = stream_clone.set_active(state) {
+                            emit_error(
+                                &error_callback_cmd,
+                                Error::with_message(
+                                    ErrorKind::StreamInvalidated,
+                                    format!("PipeWire: set_active({state}) failed: {e}"),
+                                ),
+                            );
+                        }
+
                         set_active_stream_pos(Arc::clone(&pos_clone), state);
                     }
                     StreamCommand::Stop => {
-                        let _ = stream.disconnect();
+                        if let Err(e) = stream_clone.disconnect() {
+                            emit_error(
+                                &error_callback_cmd,
+                                Error::with_message(
+                                    ErrorKind::StreamInvalidated,
+                                    format!("PipeWire: stream disconnect failed: {e}"),
+                                ),
+                            );
+                        }
                         mainloop_rc1.quit();
                     }
                 });
+
+                if init_tx.send(Ok(())).is_err() {
+                    return;
+                }
+
+                // If the Latch is dropped without being released (error path), exit cleanly.
+                if !waiter.wait() {
+                    return;
+                }
+
                 mainloop.run();
                 drop(listener);
+                drop(default_monitor);
+                drop(core_monitor);
+                drop(core);
                 drop(context);
             })
-            .map_err(|e| crate::BuildStreamError::BackendSpecific {
-                err: crate::BackendSpecificError {
-                    description: format!("failed to create thread: {e}"),
-                },
+            .map_err(|e| {
+                Error::with_message(
+                    ErrorKind::ResourceExhausted,
+                    format!("Failed to create thread: {e}"),
+                )
             })?;
-        match pw_init_rx.recv_timeout(wait_timeout) {
-            Ok(true) => Ok(Stream {
-                handle: Some(handle),
-                controller: pw_play_tx,
-                last_quantum,
-                pos,
-            }),
-            Ok(false) => Err(crate::BuildStreamError::StreamConfigNotSupported),
-            Err(_) => Err(crate::BuildStreamError::BackendSpecific {
-                err: crate::BackendSpecificError {
-                    description: "pipewire timeout".to_owned(),
-                },
-            }),
+
+        let init_result = init_rx.recv_timeout(wait_timeout).unwrap_or_else(|_| {
+            Err(Error::with_message(
+                ErrorKind::DeviceNotAvailable,
+                "PipeWire timed out",
+            ))
+        });
+
+        if let Err(e) = init_result {
+            drop(latch);
+            return Err(e);
         }
+
+        latch.add_thread(handle.thread().clone());
+        let stream = Stream::new(handle, pw_play_tx, last_quantum, start, latch, pos);
+        stream.signal_ready();
+        Ok(stream)
     }
 }
 
@@ -473,10 +718,10 @@ fn set_active_stream_pos(pos: Arc<Atomic<StreamPos>>, active: bool) {
     pos.store(pos_inner, Ordering::Relaxed);
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 struct Settings {
     rate: SampleRate,
-    allow_rates: Vec<SampleRate>,
+    allow_rates: Box<[SampleRate]>,
     quantum: FrameCount,
     min_quantum: FrameCount,
     max_quantum: FrameCount,
@@ -501,19 +746,36 @@ impl From<MetadataListener> for Request {
     }
 }
 
-pub fn init_devices() -> Option<Vec<Device>> {
-    pw::init();
-    let mainloop = pw::main_loop::MainLoopRc::new(None).ok()?;
-    let context = pw::context::ContextRc::new(&mainloop, None).ok()?;
-    let core = context.connect_rc(None).ok()?;
+/// Per-node rate and quantum discovered during device enumeration.
+struct NodeOverrides {
+    rate: Option<SampleRate>,
+    quantum: Option<FrameCount>,
+}
+
+/// Parses a PipeWire fraction string like "1/48000" or "256/48000" into its parts.
+fn parse_fraction(s: &str) -> Option<(u32, u32)> {
+    let mut it = s.splitn(2, '/');
+    let num: u32 = it.next()?.parse().ok()?;
+    let den: u32 = it.next()?.parse().ok()?;
+    Some((num, den))
+}
+
+fn remote_props() -> Option<PropertiesBox> {
+    let socket = super::utils::find_socket_path()?;
+    let mut props = PropertiesBox::new();
+    props.insert(*pw::keys::REMOTE_NAME, socket.to_string_lossy().as_ref());
+    Some(props)
+}
+
+pub fn init_devices(connect_automatically: Arc<AtomicBool>) -> Option<Vec<Device>> {
+    let _pw = PwInitGuard::new();
+    let mainloop = MainLoopRc::new(None).ok()?;
+    let context = ContextRc::new(&mainloop, None).ok()?;
+    let core = context.connect_rc(remote_props()).ok()?;
     let registry = core.get_registry_rc().ok()?;
 
-    // To comply with Rust's safety rules, we wrap this variable in an `Rc` and  a `Cell`.
-    let devices: Rc<RefCell<Vec<Device>>> = Rc::new(RefCell::new(vec![
-        Device::sink_default(),
-        Device::input_default(),
-        Device::output_default(),
-    ]));
+    // Discovered hardware nodes collected during enumeration.
+    let discovered: Rc<RefCell<Vec<(Device, NodeOverrides)>>> = Rc::new(RefCell::new(vec![]));
     let requests = Rc::new(RefCell::new(vec![]));
     let settings = Rc::new(RefCell::new(Settings::default()));
     let loop_clone = mainloop.clone();
@@ -530,7 +792,7 @@ pub fn init_devices() -> Option<Vec<Device>> {
         .done({
             let pending_events = pending_events.clone();
             move |id, seq| {
-                if id != pw::core::PW_ID_CORE {
+                if id != PW_ID_CORE {
                     return;
                 }
                 let mut pendinglist = pending_events.borrow_mut();
@@ -548,12 +810,12 @@ pub fn init_devices() -> Option<Vec<Device>> {
     let _listener_reg = registry
         .add_listener_local()
         .global({
-            let devices = devices.clone();
+            let discovered = discovered.clone();
             let registry = registry.clone();
             let requests = requests.clone();
             let settings = settings.clone();
             move |global| match global.type_ {
-                pipewire::types::ObjectType::Metadata => {
+                ObjectType::Metadata => {
                     if !global.props.is_some_and(|props| {
                         props
                             .get(METADATA_NAME)
@@ -586,7 +848,8 @@ pub fn init_devices() -> Option<Vec<Device>> {
                                         return 0;
                                     };
 
-                                    settings.borrow_mut().allow_rates = allow_rates;
+                                    settings.borrow_mut().allow_rates =
+                                        allow_rates.into_boxed_slice();
                                 }
                                 (Some(clock::QUANTUM), Some(quantum)) => {
                                     let Ok(quantum) = quantum.parse() else {
@@ -620,7 +883,7 @@ pub fn init_devices() -> Option<Vec<Device>> {
                         .borrow_mut()
                         .push((meta_settings.upcast(), Request::Meta(listener)));
                 }
-                pipewire::types::ObjectType::Node => {
+                ObjectType::Node => {
                     let Some(props) = global.props else {
                         return;
                     };
@@ -648,7 +911,7 @@ pub fn init_devices() -> Option<Vec<Device>> {
                         }
                     };
 
-                    let devices = devices.clone();
+                    let discovered = discovered.clone();
                     let listener = node
                         .add_listener_local()
                         .info(move |info| {
@@ -668,6 +931,12 @@ pub fn init_devices() -> Option<Vec<Device>> {
                                     return;
                                 }
                             };
+                            // Discovered `Audio/Sink` nodes are exposed as
+                            // `Duplex`, so they are treated as input-capable.
+                            // When cpal later opens an input stream on such
+                            // a device, it sets `STREAM_CAPTURE_SINK`, which
+                            // makes that stream capture audio playing to the
+                            // sink.
                             let direction = match role {
                                 Role::Sink => DeviceDirection::Duplex,
                                 Role::Source => DeviceDirection::Input,
@@ -719,6 +988,29 @@ pub fn init_devices() -> Option<Vec<Device>> {
 
                             let driver = props.get(*pw::keys::FACTORY_NAME).map(|s| s.to_owned());
 
+                            // "node.rate" = "1/<sample_rate>" — set by the driver, authoritative
+                            // for the hardware clock rate.
+                            let node_rate: Option<SampleRate> = props
+                                .get(node::RATE)
+                                .and_then(parse_fraction)
+                                .filter(|(_, den)| *den > 0)
+                                .map(|(_, den)| den);
+
+                            // "node.latency" = "<frames>/<rate>" — preferred quantum; the rate
+                            // denominator is a fallback when node.rate is absent.
+                            let (node_quantum, latency_rate): (
+                                Option<FrameCount>,
+                                Option<SampleRate>,
+                            ) = props
+                                .get(node::LATENCY)
+                                .and_then(parse_fraction)
+                                .filter(|(num, den)| *num > 0 && *den > 0)
+                                .unzip();
+
+                            // node.rate is authoritative; node.latency denominator is the
+                            // fallback for devices that advertise latency but not a direct rate.
+                            let rate_override = node_rate.or(latency_rate);
+
                             let device = Device {
                                 node_name,
                                 nick_name,
@@ -733,7 +1025,13 @@ pub fn init_devices() -> Option<Vec<Device>> {
                                 driver,
                                 ..Default::default()
                             };
-                            devices.borrow_mut().push(device);
+                            discovered.borrow_mut().push((
+                                device,
+                                NodeOverrides {
+                                    rate: rate_override,
+                                    quantum: node_quantum,
+                                },
+                            ));
                         })
                         .register();
                     let Ok(pending) = core.sync(0) else {
@@ -750,40 +1048,81 @@ pub fn init_devices() -> Option<Vec<Device>> {
         })
         .register();
 
-    mainloop.run();
+    // Guard against PipeWire daemons that accept a connection but never send `done` events.
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    let (timeout_tx, timeout_rx) = pw::channel::channel::<()>();
+    let loop_quit = mainloop.clone();
+    let _timeout_watcher = timeout_rx.attach(mainloop.loop_(), move |_| {
+        loop_quit.quit();
+    });
+    thread::spawn(move || {
+        if cancel_rx.recv_timeout(INIT_TIMEOUT).is_err() {
+            let _ = timeout_tx.send(());
+        }
+    });
 
-    let mut devices = devices.take();
+    mainloop.run();
+    let _ = cancel_tx.send(());
+
+    // If PipeWire connected but discovered no real audio nodes, it cannot route any streams. Treat
+    // this as unavailable so the caller can fall back to PulseAudio or ALSA.
+    if discovered.borrow().is_empty() {
+        return None;
+    }
+
     let settings = settings.take();
+
+    // Build the three synthetic default devices and apply global clock settings to them.
+    let mut devices = vec![
+        Device::sink_default(),
+        Device::input_default(),
+        Device::output_default(),
+    ];
+    let shared_rates: Arc<[SampleRate]> = Arc::from(settings.allow_rates.as_ref());
     for device in devices.iter_mut() {
         device.rate = settings.rate;
-        device.allow_rates = settings.allow_rates.clone();
+        device.allow_rates = Arc::clone(&shared_rates);
         device.quantum = settings.quantum;
         device.min_quantum = settings.min_quantum;
         device.max_quantum = settings.max_quantum;
+        device.connect_automatically = connect_automatically.clone();
     }
+
+    // Resolve each discovered hardware node: global settings apply unless the node
+    // advertised its own rate or quantum, in which case those take precedence.
+    devices.extend(
+        discovered
+            .take()
+            .into_iter()
+            .map(|(mut device, overrides)| {
+                device.rate = overrides.rate.unwrap_or(settings.rate);
+                device.allow_rates = Arc::clone(&shared_rates);
+                device.quantum = overrides.quantum.unwrap_or(settings.quantum);
+                device.min_quantum = settings.min_quantum;
+                device.max_quantum = settings.max_quantum;
+                device.connect_automatically = connect_automatically.clone();
+                device
+            }),
+    );
+
     Some(devices)
 }
 
-fn parse_allow_rates(list: &str) -> Option<Vec<u32>> {
-    let list: Vec<&str> = list
-        .trim()
+fn parse_allow_rates(list: &str) -> Option<Vec<SampleRate>> {
+    list.trim()
         .strip_prefix("[")?
         .strip_suffix("]")?
-        .split(' ')
-        .flat_map(|s| s.split(','))
+        .split([' ', ','])
         .filter(|s| !s.is_empty())
-        .collect();
-    let mut allow_rates = vec![];
-    for rate in list {
-        let rate = rate.parse().ok()?;
-        allow_rates.push(rate);
-    }
-    Some(allow_rates)
+        .map(|s| s.parse().ok())
+        .collect()
 }
 
 #[cfg(test)]
 mod test {
-    use super::parse_allow_rates;
+    use super::{parse_allow_rates, parse_fraction, Class, Device};
+    use crate::host::pipewire::utils::default;
+
     #[test]
     fn rate_parse() {
         // In documents, the rates are separated by space
@@ -799,5 +1138,47 @@ mod test {
         let rate_str = r#"  { 44100, 48000, 88200, 96000 ,176400 ,192000 } "#;
         let rates = parse_allow_rates(rate_str);
         assert_eq!(rates, None);
+    }
+
+    #[test]
+    fn fraction_parse() {
+        // node.rate format: "1/<sample_rate>"
+        assert_eq!(parse_fraction("1/48000"), Some((1, 48000)));
+
+        // node.latency format: "<quantum>/<rate>"
+        assert_eq!(parse_fraction("256/48000"), Some((256, 48000)));
+
+        // zero values are returned as-is; callers apply .filter() to reject them
+        assert_eq!(parse_fraction("0/48000"), Some((0, 48000)));
+        assert_eq!(parse_fraction("256/0"), Some((256, 0)));
+
+        // invalid inputs
+        assert_eq!(parse_fraction(""), None);
+        assert_eq!(parse_fraction("48000"), None);
+        assert_eq!(parse_fraction("abc/def"), None);
+        assert_eq!(parse_fraction("/48000"), None);
+        assert_eq!(parse_fraction("256/"), None);
+    }
+
+    #[test]
+    fn default_metadata_key_mapping() {
+        assert_eq!(
+            Device::output_default().default_metadata_key(),
+            Some(default::SINK)
+        );
+        assert_eq!(
+            Device::sink_default().default_metadata_key(),
+            Some(default::SINK)
+        );
+        assert_eq!(
+            Device::input_default().default_metadata_key(),
+            Some(default::SOURCE)
+        );
+
+        let node = Device {
+            class: Class::Node,
+            ..Default::default()
+        };
+        assert_eq!(node.default_metadata_key(), None);
     }
 }

@@ -2,12 +2,17 @@
 //!
 //! The input data is recorded to "$CARGO_MANIFEST_DIR/recorded.wav".
 
+use std::{
+    fs::File,
+    io::BufWriter,
+    sync::{Arc, Mutex},
+};
+
 use clap::Parser;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, HostUnavailable, Sample};
-use std::fs::File;
-use std::io::BufWriter;
-use std::sync::{Arc, Mutex};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Error, ErrorKind, FromSample, HostId, Sample, SampleFormat, SupportedStreamConfig,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "CPAL record_wav example", long_about = None)]
@@ -39,11 +44,11 @@ fn main() -> Result<(), anyhow::Error> {
     // Jack/PulseAudio support must be enabled at compile time, and is
     // only available on some platforms.
     #[allow(unused_mut, unused_assignments)]
-    let mut jack_host_id = Err(HostUnavailable);
+    let mut jack_host_id: Result<HostId, Error> = Err(ErrorKind::HostUnavailable.into());
     #[allow(unused_mut, unused_assignments)]
-    let mut pulseaudio_host_id = Err(HostUnavailable);
+    let mut pulseaudio_host_id: Result<HostId, Error> = Err(ErrorKind::HostUnavailable.into());
     #[allow(unused_mut, unused_assignments)]
-    let mut pipewire_host_id = Err(HostUnavailable);
+    let mut pipewire_host_id: Result<HostId, Error> = Err(ErrorKind::HostUnavailable.into());
     #[cfg(any(
         target_os = "linux",
         target_os = "dragonfly",
@@ -53,16 +58,16 @@ fn main() -> Result<(), anyhow::Error> {
     {
         #[cfg(feature = "jack")]
         {
-            jack_host_id = Ok(cpal::HostId::Jack);
+            jack_host_id = Ok(HostId::Jack);
         }
 
         #[cfg(feature = "pulseaudio")]
         {
-            pulseaudio_host_id = Ok(cpal::HostId::PulseAudio);
+            pulseaudio_host_id = Ok(HostId::PulseAudio);
         }
         #[cfg(feature = "pipewire")]
         {
-            pipewire_host_id = Ok(cpal::HostId::PipeWire);
+            pipewire_host_id = Ok(HostId::PipeWire);
         }
     }
 
@@ -115,30 +120,33 @@ fn main() -> Result<(), anyhow::Error> {
     // Run the input stream on a separate thread.
     let writer_2 = writer.clone();
 
-    let err_fn = move |err| {
-        eprintln!("an error occurred on stream: {err}");
+    let err_fn = move |err: Error| match err.kind() {
+        ErrorKind::DeviceChanged | ErrorKind::Xrun | ErrorKind::RealtimeDenied => {
+            eprintln!("{err}")
+        }
+        _ => eprintln!("Stream error: {err}"),
     };
 
     let stream = match config.sample_format() {
-        cpal::SampleFormat::I8 => device.build_input_stream(
+        SampleFormat::I8 => device.build_input_stream(
             config.into(),
             move |data, _: &_| write_input_data::<i8, i8>(data, &writer_2),
             err_fn,
             None,
         )?,
-        cpal::SampleFormat::I16 => device.build_input_stream(
+        SampleFormat::I16 => device.build_input_stream(
             config.into(),
             move |data, _: &_| write_input_data::<i16, i16>(data, &writer_2),
             err_fn,
             None,
         )?,
-        cpal::SampleFormat::I32 => device.build_input_stream(
+        SampleFormat::I32 => device.build_input_stream(
             config.into(),
             move |data, _: &_| write_input_data::<i32, i32>(data, &writer_2),
             err_fn,
             None,
         )?,
-        cpal::SampleFormat::F32 => device.build_input_stream(
+        SampleFormat::F32 => device.build_input_stream(
             config.into(),
             move |data, _: &_| write_input_data::<f32, f32>(data, &writer_2),
             err_fn,
@@ -161,7 +169,7 @@ fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn sample_format(format: cpal::SampleFormat) -> hound::SampleFormat {
+fn sample_format(format: SampleFormat) -> hound::SampleFormat {
     if format.is_dsd() {
         panic!("DSD formats cannot be written to WAV files");
     } else if format.is_float() {
@@ -171,7 +179,7 @@ fn sample_format(format: cpal::SampleFormat) -> hound::SampleFormat {
     }
 }
 
-fn wav_spec_from_config(config: &cpal::SupportedStreamConfig) -> hound::WavSpec {
+fn wav_spec_from_config(config: &SupportedStreamConfig) -> hound::WavSpec {
     hound::WavSpec {
         channels: config.channels() as _,
         sample_rate: config.sample_rate() as _,

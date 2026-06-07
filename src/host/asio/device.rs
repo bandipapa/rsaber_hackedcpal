@@ -1,26 +1,16 @@
-pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    sync::{atomic::AtomicU32, Arc, Mutex},
+};
 
 use super::sys;
-use crate::host::com;
-use crate::ChannelCount;
-use crate::DefaultStreamConfigError;
-use crate::DeviceDescription;
-use crate::DeviceDescriptionBuilder;
-use crate::DeviceId;
-use crate::DeviceIdError;
-use crate::DeviceNameError;
-use crate::DevicesError;
-use crate::FrameCount;
-use crate::SampleFormat;
-use crate::SampleRate;
-use crate::SupportedBufferSize;
-use crate::SupportedStreamConfig;
-use crate::SupportedStreamConfigRange;
-use crate::SupportedStreamConfigsError;
-
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Mutex};
+pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
+use crate::{
+    host::com, ChannelCount, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error,
+    ErrorKind, FrameCount, SampleFormat, SampleRate, SupportedBufferSize, SupportedStreamConfig,
+    SupportedStreamConfigRange,
+};
 
 /// A ASIO Device
 #[derive(Clone)]
@@ -35,7 +25,7 @@ pub struct Device {
     buffer_size_max: FrameCount,
     input_sample_format: Option<SampleFormat>,
     output_sample_format: Option<SampleFormat>,
-    supported_sample_rates: Vec<SampleRate>,
+    supported_sample_rates: Box<[SampleRate]>,
 
     // Input and/or Output stream.
     // A driver can only have one of each.
@@ -51,68 +41,46 @@ pub struct Devices {
     current_driver: Option<sys::Driver>,
 }
 
-impl PartialEq for Device {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
-}
-
-impl Eq for Device {}
-
-impl Hash for Device {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-    }
-}
-
 impl Device {
-    pub fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
+    pub fn description(&self) -> Result<DeviceDescription, Error> {
         let direction = crate::device_description::direction_from_counts(
             Some(self.channels_in),
             Some(self.channels_out),
         );
 
-        Ok(DeviceDescriptionBuilder::new(self.name.clone())
-            .driver(self.name.clone())
+        Ok(DeviceDescriptionBuilder::new(&self.name)
+            .driver(&self.name)
             .direction(direction)
             .build())
     }
 
-    pub fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId(crate::platform::HostId::Asio, self.name.clone()))
+    pub fn id(&self) -> Result<DeviceId, Error> {
+        Ok(DeviceId::new(crate::platform::HostId::Asio, &self.name))
     }
 
     /// Gets the supported input configs.
     /// TODO currently only supports the default.
     /// Need to find all possible configs.
-    pub fn supported_input_configs(
-        &self,
-    ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
-        let default = self
-            .default_input_config()
-            .map_err(|_| SupportedStreamConfigsError::DeviceNotAvailable)?;
+    pub fn supported_input_configs(&self) -> Result<SupportedInputConfigs, Error> {
+        let default = self.default_input_config()?;
         Ok(self.configs_for(default).into_iter())
     }
 
     /// Gets the supported output configs.
     /// TODO currently only supports the default.
     /// Need to find all possible configs.
-    pub fn supported_output_configs(
-        &self,
-    ) -> Result<SupportedOutputConfigs, SupportedStreamConfigsError> {
-        let default = self
-            .default_output_config()
-            .map_err(|_| SupportedStreamConfigsError::DeviceNotAvailable)?;
+    pub fn supported_output_configs(&self) -> Result<SupportedOutputConfigs, Error> {
+        let default = self.default_output_config()?;
         Ok(self.configs_for(default).into_iter())
     }
 
     /// Returns the default input config
-    pub fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    pub fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
         self.default_config(self.channels_in, self.input_sample_format)
     }
 
     /// Returns the default output config
-    pub fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    pub fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
         self.default_config(self.channels_out, self.output_sample_format)
     }
 
@@ -120,12 +88,19 @@ impl Device {
         &self,
         channels: ChannelCount,
         sample_format: Option<SampleFormat>,
-    ) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    ) -> Result<SupportedStreamConfig, Error> {
         if channels == 0 {
-            return Err(DefaultStreamConfigError::StreamTypeNotSupported);
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "Device reports no channels for this direction",
+            ));
         }
-        let sample_format =
-            sample_format.ok_or(DefaultStreamConfigError::StreamTypeNotSupported)?;
+        let sample_format = sample_format.ok_or_else(|| {
+            Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "No supported sample format",
+            )
+        })?;
         Ok(SupportedStreamConfig {
             channels,
             sample_rate: self.sample_rate,
@@ -154,8 +129,37 @@ impl Device {
     }
 }
 
+impl PartialEq for Device {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for Device {}
+
+impl Hash for Device {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let desc = self.description().map_err(|_| fmt::Error)?;
+        f.write_str(desc.name())
+    }
+}
+
+impl fmt::Debug for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Device")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Devices {
-    pub fn new(asio: Arc<sys::Asio>) -> Result<Self, DevicesError> {
+    pub fn new(asio: Arc<sys::Asio>) -> Result<Self, Error> {
         // Make sure that COM is initialized.
         com::com_initialized();
         let drivers = asio.driver_names().into_iter();
@@ -171,7 +175,7 @@ impl Iterator for Devices {
     type Item = Device;
 
     /// Enumerate devices by briefly loading each driver to capture its metadata.
-    fn next(&mut self) -> Option<Device> {
+    fn next(&mut self) -> Option<Self::Item> {
         // Drop the previously loaded driver before attempting to load the next one.
         self.current_driver = None;
 
@@ -203,7 +207,7 @@ impl Iterator for Devices {
                             .ok()
                             .and_then(|t| convert_data_type(&t));
 
-                        let supported_sample_rates: Vec<SampleRate> = crate::COMMON_SAMPLE_RATES
+                        let supported_sample_rates: Box<[SampleRate]> = crate::COMMON_SAMPLE_RATES
                             .iter()
                             .copied()
                             .filter(|&r| driver.can_sample_rate(r.into()).unwrap_or(false))

@@ -1,3 +1,8 @@
+//! Low-level library for audio input and output, written in Rust.
+//!
+//! For higher-level audio playback and capture, consider
+//! [Rodio](https://github.com/RustAudio/rodio) or similar libraries.
+//!
 //! # How to use cpal
 //!
 //! Here are some concepts cpal exposes:
@@ -73,14 +78,16 @@
 //!     move |err| {
 //!         // react to errors here.
 //!     },
-//!     None // None=blocking, Some(Duration)=timeout
+//!     None // Timeout for stream initialization: None = wait indefinitely,
+//!          // Some(Duration) = time to wait for the backend to initialize the stream.
 //! );
 //! ```
 //!
-//! While the stream is running, the selected audio device will periodically call the data callback
-//! that was passed to the function. For input streams, the callback receives `&`[`Data`] containing
-//! captured audio samples. For output streams, the callback receives `&mut`[`Data`] to be filled
-//! with audio samples for playback.
+//! Streams are returned in a paused state. Once the stream has been started with
+//! [`Stream::play`](traits::StreamTrait::play), the selected audio device will periodically call
+//! the data callback that was passed to the function. For input streams, the callback receives
+//! `&`[`Data`] containing captured audio samples. For output streams, the callback receives
+//! `&mut`[`Data`] to be filled with audio samples for playback.
 //!
 //! > **Note**: Creating and running a stream will *not* block the thread. On modern platforms, the
 //! > given callback is called by a dedicated, high-priority thread responsible for delivering
@@ -116,8 +123,8 @@
 //! }
 //! ```
 //!
-//! Not all platforms automatically run the stream upon creation. To ensure the stream has started,
-//! we can use [`Stream::play`](traits::StreamTrait::play).
+//! Streams are always returned in a paused state, so we must call
+//! [`Stream::play`](traits::StreamTrait::play) to start running the data callback.
 //!
 //! ```no_run
 //! # use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -157,27 +164,12 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 // Extern crate declarations with `#[macro_use]` must unfortunately be at crate root.
-#[cfg(all(
-    target_arch = "wasm32",
-    any(target_os = "emscripten", feature = "wasm-bindgen")
-))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 extern crate js_sys;
-#[cfg(all(
-    target_arch = "wasm32",
-    any(target_os = "emscripten", feature = "wasm-bindgen")
-))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 extern crate wasm_bindgen;
-#[cfg(all(
-    target_arch = "wasm32",
-    any(target_os = "emscripten", feature = "wasm-bindgen")
-))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 extern crate web_sys;
-
-#[cfg(all(
-    target_arch = "wasm32",
-    any(target_os = "emscripten", feature = "wasm-bindgen")
-))]
-use wasm_bindgen::prelude::*;
 
 pub use device_description::{
     DeviceDescription, DeviceDescriptionBuilder, DeviceDirection, DeviceType, InterfaceType,
@@ -187,13 +179,15 @@ pub use platform::{
     available_hosts, default_host, host_from_id, Device, Devices, Host, HostId, Stream,
     SupportedInputConfigs, SupportedOutputConfigs, ALL_HOSTS,
 };
-pub use samples_formats::{FromSample, Sample, SampleFormat, SizedSample, I24, U24};
+pub use sample_format::{FromSample, Sample, SampleFormat, SizedSample, I24, U24};
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
+use wasm_bindgen::prelude::*;
 
 pub mod device_description;
 mod error;
 mod host;
 pub mod platform;
-mod samples_formats;
+mod sample_format;
 mod timestamp;
 pub mod traits;
 
@@ -211,6 +205,12 @@ pub type ChannelCount = u16;
 
 /// The number of samples processed per second for a single channel of audio.
 pub type SampleRate = u32;
+
+/// 44.1 kHz: the CD standard, widely used in music production and consumer audio.
+pub const SAMPLE_RATE_CD: SampleRate = 44_100;
+
+/// 48 kHz: the EBU/SMPTE broadcast standard, default on most modern hardware.
+pub const SAMPLE_RATE_48K: SampleRate = 48_000;
 
 /// A frame represents one sample for each channel. For example, with stereo audio,
 /// one frame contains two samples (left and right channels).
@@ -249,30 +249,65 @@ pub type FrameCount = u32;
 /// }
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DeviceId(pub crate::platform::HostId, pub String);
+pub struct DeviceId(crate::platform::HostId, Box<str>);
+
+impl DeviceId {
+    /// Creates a `DeviceId` from a host identifier and a device-specific identifier string.
+    ///
+    /// This constructor is used by backend implementations. Application code should obtain
+    /// `DeviceId` values through [`DeviceTrait::id`] and persist them via [`Display`]/[`FromStr`].
+    ///
+    /// [`DeviceTrait::id`]: crate::traits::DeviceTrait::id
+    /// [`Display`]: std::fmt::Display
+    /// [`FromStr`]: std::str::FromStr
+    pub fn new(host: crate::platform::HostId, id: impl AsRef<str>) -> Self {
+        Self(host, Box::from(id.as_ref()))
+    }
+
+    /// Returns the host this device belongs to.
+    pub fn host(&self) -> crate::platform::HostId {
+        self.0
+    }
+
+    /// Returns the backend-specific device identifier string.
+    pub fn id(&self) -> &str {
+        &self.1
+    }
+}
 
 impl std::fmt::Display for DeviceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.0, self.1)
+        write!(f, "{}:{}", self.host(), self.id())
     }
 }
 
 impl std::str::FromStr for DeviceId {
-    type Err = DeviceIdError;
+    type Err = Error;
 
+    /// Parse a device identifier from its string representation (e.g. `"alsa:hw:0,0"`).
+    ///
+    /// The format is `"<host>:<device>"` where `<host>` is the lowercase host name (see
+    /// [`HostId`]) and `<device>` is the device-specific identifier string.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::InvalidInput`] if the string is not in `"host:device"` format.
+    /// - [`ErrorKind::UnsupportedOperation`] if the host portion names a host not available on this
+    ///   platform.
+    ///
+    /// [`ErrorKind::InvalidInput`]: ErrorKind::InvalidInput
+    /// [`ErrorKind::UnsupportedOperation`]: ErrorKind::UnsupportedOperation
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (host_str, device_str) = s.split_once(':').ok_or(DeviceIdError::BackendSpecific {
-            err: BackendSpecificError {
-                description: format!(
-                    "Failed to parse device ID from: {s}\nCheck if format matches \"host:device_id\""
-                ),
-            },
+        let (host_str, device_str) = s.split_once(':').ok_or_else(|| {
+            Error::with_message(
+                ErrorKind::InvalidInput,
+                format!("failed to parse device ID \"{s}\": expected \"host:device_id\" format"),
+            )
         })?;
 
-        let host_id = crate::platform::HostId::from_str(host_str)
-            .map_err(|_| DeviceIdError::UnsupportedPlatform)?;
+        let host_id = crate::platform::HostId::from_str(host_str)?;
 
-        Ok(DeviceId(host_id, device_str.to_string()))
+        Ok(Self::new(host_id, device_str))
     }
 }
 
@@ -333,26 +368,21 @@ impl std::str::FromStr for DeviceId {
 /// [`BufferSize::Fixed(x)`]: BufferSize::Fixed
 /// [`SupportedBufferSize`]: SupportedStreamConfig::buffer_size
 /// [`SupportedStreamConfig`]: SupportedStreamConfig
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BufferSize {
+    #[default]
     Default,
     Fixed(FrameCount),
 }
 
-#[cfg(all(
-    target_arch = "wasm32",
-    any(target_os = "emscripten", feature = "wasm-bindgen")
-))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 impl wasm_bindgen::describe::WasmDescribe for BufferSize {
     fn describe() {
         <Option<FrameCount> as wasm_bindgen::describe::WasmDescribe>::describe();
     }
 }
 
-#[cfg(all(
-    target_arch = "wasm32",
-    any(target_os = "emscripten", feature = "wasm-bindgen")
-))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 impl wasm_bindgen::convert::IntoWasmAbi for BufferSize {
     type Abi = <Option<FrameCount> as wasm_bindgen::convert::IntoWasmAbi>::Abi;
 
@@ -365,10 +395,7 @@ impl wasm_bindgen::convert::IntoWasmAbi for BufferSize {
     }
 }
 
-#[cfg(all(
-    target_arch = "wasm32",
-    any(target_os = "emscripten", feature = "wasm-bindgen")
-))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 impl wasm_bindgen::convert::FromWasmAbi for BufferSize {
     type Abi = <Option<FrameCount> as wasm_bindgen::convert::FromWasmAbi>::Abi;
 
@@ -385,13 +412,7 @@ impl wasm_bindgen::convert::FromWasmAbi for BufferSize {
 /// The sample format is omitted in favour of using a sample type.
 ///
 /// See also [`BufferSize`] for details on buffer size behavior and latency considerations.
-#[cfg_attr(
-    all(
-        target_arch = "wasm32",
-        any(target_os = "emscripten", feature = "wasm-bindgen")
-    ),
-    wasm_bindgen
-)]
+#[cfg_attr(all(target_arch = "wasm32", feature = "wasm-bindgen"), wasm_bindgen)]
 #[derive(Clone, Debug, Eq, PartialEq, Copy)]
 pub struct StreamConfig {
     pub channels: ChannelCount,
@@ -400,7 +421,7 @@ pub struct StreamConfig {
 }
 
 /// Describes the minimum and maximum supported buffer size for the device
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SupportedBufferSize {
     Range {
         min: FrameCount,
@@ -408,6 +429,7 @@ pub enum SupportedBufferSize {
     },
     /// In the case that the platform provides no way of getting the default
     /// buffer size before starting a stream.
+    #[default]
     Unknown,
 }
 
@@ -449,7 +471,7 @@ pub(crate) mod iter {
 /// Describes a single supported stream configuration, retrieved via either a
 /// [`SupportedStreamConfigRange`] instance or one of the
 /// [`Device::default_input/output_config`](traits::DeviceTrait#required-methods) methods.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupportedStreamConfig {
     channels: ChannelCount,
     sample_rate: SampleRate,
@@ -460,7 +482,6 @@ pub struct SupportedStreamConfig {
 /// A buffer of dynamically typed audio data, passed to raw stream callbacks.
 ///
 /// Raw input stream callbacks receive `&Data`, while raw output stream callbacks expect `&mut Data`.
-#[cfg_attr(target_os = "emscripten", wasm_bindgen)]
 #[derive(Debug)]
 pub struct Data {
     data: *mut (),
@@ -527,7 +548,7 @@ impl Data {
     /// - The `sample_format` must correctly represent the underlying sample data delivered/expected
     ///   by the stream.
     pub unsafe fn from_parts(data: *mut (), len: usize, sample_format: SampleFormat) -> Self {
-        Data {
+        Self {
             data,
             len,
             sample_format,
@@ -642,7 +663,7 @@ impl SupportedStreamConfigRange {
         self.sample_format
     }
 
-    /// Retrieve a [`SupportedStreamConfig`] with the given sample rate and buffer size.
+    /// Retrieve a [`SupportedStreamConfig`] with the given sample rate.
     ///
     /// # Panics
     ///
@@ -654,7 +675,7 @@ impl SupportedStreamConfigRange {
             .expect("sample rate out of range")
     }
 
-    /// Retrieve a [`SupportedStreamConfig`] with the given sample rate and buffer size.
+    /// Retrieve a [`SupportedStreamConfig`] with the given sample rate.
     ///
     /// Returns `None` if the given sample rate is outside the range specified
     /// within this [`SupportedStreamConfigRange`] instance.
@@ -682,33 +703,73 @@ impl SupportedStreamConfigRange {
         }
     }
 
-    /// A comparison function which compares two [`SupportedStreamConfigRange`]s in terms of their priority of
-    /// use as a default stream format.
+    /// Returns `true` if `rate` falls within `[min_sample_rate, max_sample_rate]`.
+    pub fn contains_rate(&self, rate: SampleRate) -> bool {
+        self.min_sample_rate <= rate && rate <= self.max_sample_rate
+    }
+
+    /// Retrieve a [`SupportedStreamConfig`] with a standard sample rate.
+    ///
+    /// The preferred rate is selected in order:
+    /// 1. 48 kHz as the dominant native rate on modern hardware.
+    /// 2. 44.1 kHz as the standard CD/consumer rate.
+    ///
+    /// Returns `None` if neither standard rate falls within the range specified within this
+    /// [`SupportedStreamConfigRange`] instance.
+    pub fn try_with_standard_sample_rate(self) -> Option<SupportedStreamConfig> {
+        for rate in [SAMPLE_RATE_48K, SAMPLE_RATE_CD] {
+            if self.contains_rate(rate) {
+                return Some(self.with_sample_rate(rate));
+            }
+        }
+        None
+    }
+
+    /// Retrieve a [`SupportedStreamConfig`] with a standard sample rate.
+    ///
+    /// The preferred rate is selected in order:
+    /// 1. 48 kHz as the dominant native rate on modern hardware.
+    /// 2. 44.1 kHz as the standard CD/consumer rate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if neither standard rate falls within the range specified within this
+    /// [`SupportedStreamConfigRange`] instance. For a non-panicking variant, use
+    /// [`try_with_standard_sample_rate`](Self::try_with_standard_sample_rate).
+    pub fn with_standard_sample_rate(self) -> SupportedStreamConfig {
+        self.try_with_standard_sample_rate()
+            .expect("no standard sample rate (48000 or 44100 Hz) in supported range")
+    }
+
+    /// A comparison function which compares two [`SupportedStreamConfigRange`]s in terms of their
+    /// priority of use as a default stream format.
     ///
     /// Some backends do not provide a default stream format for their audio devices. In these
     /// cases, CPAL attempts to decide on a reasonable default format for the user. To do this we
     /// use the "greatest" of all supported stream formats when compared with this method.
     ///
-    /// SupportedStreamConfigs are prioritised by the following heuristics:
+    /// [`SupportedStreamConfig`]s are prioritised by the following heuristics, applied in order:
     ///
     /// **Channels**:
     ///
-    /// - Stereo
-    /// - Mono
-    /// - Max available channels
+    /// 1. Stereo
+    /// 2. Mono
+    /// 3. Highest available channel count
     ///
-    /// **Sample format**:
-    /// - f32
-    /// - i16
-    /// - u16
+    /// **Sample format** (most preferred first):
+    ///
+    /// F32 is ranked highest as the universal realtime audio format, followed by F64. Standard
+    /// integer widths descend by bit depth (I32 > I24 > I16); 64-bit integers are deprioritised
+    /// below I16 as accumulator types rather than native stream formats. Signed beats unsigned
+    /// at the same width. DSD ranks last as non-PCM.
     ///
     /// **Sample rate**:
     ///
-    /// - 44100 (cd quality)
-    /// - Max sample rate
+    /// 1. 48 kHz (EBU/SMPTE broadcast standard)
+    /// 2. 44.1 kHz (CD standard)
+    /// 3. Highest supported sample rate
     pub fn cmp_default_heuristics(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering::Equal;
-        use SampleFormat::{F32, I16, I24, I32, U16, U24, U32};
 
         let cmp_stereo = (self.channels == 2).cmp(&(other.channels == 2));
         if cmp_stereo != Equal {
@@ -725,121 +786,48 @@ impl SupportedStreamConfigRange {
             return cmp_channels;
         }
 
-        let cmp_f32 = (self.sample_format == F32).cmp(&(other.sample_format == F32));
-        if cmp_f32 != Equal {
-            return cmp_f32;
+        fn format_rank(fmt: SampleFormat) -> u8 {
+            match fmt {
+                SampleFormat::DsdU8 => 0,
+                SampleFormat::DsdU16 => 1,
+                SampleFormat::DsdU32 => 2,
+                SampleFormat::U8 => 3,
+                SampleFormat::I8 => 4,
+                // 64-bit integers: deprioritised below standard audio widths.
+                SampleFormat::U64 => 5,
+                SampleFormat::I64 => 6,
+                SampleFormat::U16 => 7,
+                SampleFormat::I16 => 8,
+                SampleFormat::U24 => 9,
+                SampleFormat::I24 => 10,
+                SampleFormat::U32 => 11,
+                SampleFormat::I32 => 12,
+                SampleFormat::F64 => 13,
+                SampleFormat::F32 => 14,
+            }
         }
 
-        let cmp_i32 = (self.sample_format == I32).cmp(&(other.sample_format == I32));
-        if cmp_i32 != Equal {
-            return cmp_i32;
+        let cmp_format = format_rank(self.sample_format).cmp(&format_rank(other.sample_format));
+        if cmp_format != Equal {
+            return cmp_format;
         }
 
-        let cmp_u32 = (self.sample_format == U32).cmp(&(other.sample_format == U32));
-        if cmp_u32 != Equal {
-            return cmp_u32;
+        let cmp_broadcast = self
+            .contains_rate(SAMPLE_RATE_48K)
+            .cmp(&other.contains_rate(SAMPLE_RATE_48K));
+        if cmp_broadcast != Equal {
+            return cmp_broadcast;
         }
 
-        let cmp_i24 = (self.sample_format == I24).cmp(&(other.sample_format == I24));
-        if cmp_i24 != Equal {
-            return cmp_i24;
-        }
-
-        let cmp_u24 = (self.sample_format == U24).cmp(&(other.sample_format == U24));
-        if cmp_u24 != Equal {
-            return cmp_u24;
-        }
-
-        let cmp_i16 = (self.sample_format == I16).cmp(&(other.sample_format == I16));
-        if cmp_i16 != Equal {
-            return cmp_i16;
-        }
-
-        let cmp_u16 = (self.sample_format == U16).cmp(&(other.sample_format == U16));
-        if cmp_u16 != Equal {
-            return cmp_u16;
-        }
-
-        const HZ_44100: SampleRate = 44_100;
-        let r44100_in_self = self.min_sample_rate <= HZ_44100 && HZ_44100 <= self.max_sample_rate;
-        let r44100_in_other =
-            other.min_sample_rate <= HZ_44100 && HZ_44100 <= other.max_sample_rate;
-        let cmp_r44100 = r44100_in_self.cmp(&r44100_in_other);
-        if cmp_r44100 != Equal {
-            return cmp_r44100;
+        let cmp_cd = self
+            .contains_rate(SAMPLE_RATE_CD)
+            .cmp(&other.contains_rate(SAMPLE_RATE_CD));
+        if cmp_cd != Equal {
+            return cmp_cd;
         }
 
         self.max_sample_rate.cmp(&other.max_sample_rate)
     }
-}
-
-#[test]
-fn test_cmp_default_heuristics() {
-    let mut formats = [
-        SupportedStreamConfigRange {
-            buffer_size: SupportedBufferSize::Range { min: 256, max: 512 },
-            channels: 2,
-            min_sample_rate: 1,
-            max_sample_rate: 96000,
-            sample_format: SampleFormat::F32,
-        },
-        SupportedStreamConfigRange {
-            buffer_size: SupportedBufferSize::Range { min: 256, max: 512 },
-            channels: 1,
-            min_sample_rate: 1,
-            max_sample_rate: 96000,
-            sample_format: SampleFormat::F32,
-        },
-        SupportedStreamConfigRange {
-            buffer_size: SupportedBufferSize::Range { min: 256, max: 512 },
-            channels: 2,
-            min_sample_rate: 1,
-            max_sample_rate: 96000,
-            sample_format: SampleFormat::I16,
-        },
-        SupportedStreamConfigRange {
-            buffer_size: SupportedBufferSize::Range { min: 256, max: 512 },
-            channels: 2,
-            min_sample_rate: 1,
-            max_sample_rate: 96000,
-            sample_format: SampleFormat::U16,
-        },
-        SupportedStreamConfigRange {
-            buffer_size: SupportedBufferSize::Range { min: 256, max: 512 },
-            channels: 2,
-            min_sample_rate: 1,
-            max_sample_rate: 22050,
-            sample_format: SampleFormat::F32,
-        },
-    ];
-
-    formats.sort_by(|a, b| a.cmp_default_heuristics(b));
-
-    // lowest-priority first:
-    assert_eq!(formats[0].sample_format(), SampleFormat::F32);
-    assert_eq!(formats[0].min_sample_rate(), 1);
-    assert_eq!(formats[0].max_sample_rate(), 96000);
-    assert_eq!(formats[0].channels(), 1);
-
-    assert_eq!(formats[1].sample_format(), SampleFormat::U16);
-    assert_eq!(formats[1].min_sample_rate(), 1);
-    assert_eq!(formats[1].max_sample_rate(), 96000);
-    assert_eq!(formats[1].channels(), 2);
-
-    assert_eq!(formats[2].sample_format(), SampleFormat::I16);
-    assert_eq!(formats[2].min_sample_rate(), 1);
-    assert_eq!(formats[2].max_sample_rate(), 96000);
-    assert_eq!(formats[2].channels(), 2);
-
-    assert_eq!(formats[3].sample_format(), SampleFormat::F32);
-    assert_eq!(formats[3].min_sample_rate(), 1);
-    assert_eq!(formats[3].max_sample_rate(), 22050);
-    assert_eq!(formats[3].channels(), 2);
-
-    assert_eq!(formats[4].sample_format(), SampleFormat::F32);
-    assert_eq!(formats[4].min_sample_rate(), 1);
-    assert_eq!(formats[4].max_sample_rate(), 96000);
-    assert_eq!(formats[4].channels(), 2);
 }
 
 impl From<SupportedStreamConfig> for StreamConfig {
@@ -848,10 +836,226 @@ impl From<SupportedStreamConfig> for StreamConfig {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn validate_stream_config(config: &StreamConfig) -> Result<(), Error> {
+    if config.channels == 0 {
+        return Err(Error::with_message(
+            ErrorKind::InvalidInput,
+            "channel count must be at least 1",
+        ));
+    }
+    if config.sample_rate == 0 {
+        return Err(Error::with_message(
+            ErrorKind::InvalidInput,
+            "sample rate must be at least 1 Hz",
+        ));
+    }
+    if config.buffer_size == BufferSize::Fixed(0) {
+        return Err(Error::with_message(
+            ErrorKind::InvalidInput,
+            "buffer size must be greater than 0",
+        ));
+    }
+    Ok(())
+}
+
 // If a backend does not provide an API for retrieving supported formats, we query it with a bunch
 // of commonly used rates. This is always the case for WASAPI and is sometimes the case for ALSA.
 #[allow(dead_code)]
 pub(crate) const COMMON_SAMPLE_RATES: &[SampleRate] = &[
-    5512, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000,
-    176400, 192000, 352800, 384000, 705600, 768000, 1411200, 1536000,
+    // Standard PCM rates and DSD sample rates through DSD512
+    5512, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000, 176400,
+    192000, 352800, 384000, 705600, 768000, 1411200, 1536000, 2822400, 3072000, 5644800, 6144000,
+    11289600, 12288000, 22579200, 24576000,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_range(
+        channels: ChannelCount,
+        format: SampleFormat,
+        min: SampleRate,
+        max: SampleRate,
+    ) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange {
+            buffer_size: SupportedBufferSize::Range { min: 256, max: 512 },
+            channels,
+            min_sample_rate: min,
+            max_sample_rate: max,
+            sample_format: format,
+        }
+    }
+
+    #[test]
+    fn with_standard_sample_rate() {
+        let r = |min, max| make_range(2, SampleFormat::F32, min, max);
+
+        assert_eq!(
+            r(1, 96_000).with_standard_sample_rate().sample_rate(),
+            SAMPLE_RATE_48K
+        );
+        assert_eq!(
+            r(1, 44_100).with_standard_sample_rate().sample_rate(),
+            SAMPLE_RATE_CD
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no standard sample rate")]
+    fn with_standard_sample_rate_panics_when_no_standard_rate() {
+        make_range(2, SampleFormat::F32, 8_000, 32_000).with_standard_sample_rate();
+    }
+
+    #[test]
+    fn try_with_standard_sample_rate() {
+        let r = |min, max| make_range(2, SampleFormat::F32, min, max);
+
+        // 48 kHz available; first choice
+        assert_eq!(
+            r(1, 96_000)
+                .try_with_standard_sample_rate()
+                .map(|c| c.sample_rate()),
+            Some(SAMPLE_RATE_48K)
+        );
+
+        // 48 kHz not available but 44.1 kHz is; second choice
+        assert_eq!(
+            r(1, 44_100)
+                .try_with_standard_sample_rate()
+                .map(|c| c.sample_rate()),
+            Some(SAMPLE_RATE_CD)
+        );
+
+        // Neither preferred rate available
+        assert_eq!(r(8_000, 32_000).try_with_standard_sample_rate(), None);
+    }
+
+    #[test]
+    fn cmp_default_heuristics_format_order() {
+        use SampleFormat::*;
+
+        // Input is deliberately not sorted to prove the sort works.
+        let unsorted = [
+            F32, I16, DsdU32, U64, I32, DsdU8, F64, U8, I24, U16, I64, U24, U32, I8, DsdU16,
+        ];
+
+        let mut ranges: Vec<_> = unsorted
+            .iter()
+            .map(|&fmt| make_range(2, fmt, 1, 96_000))
+            .collect();
+        ranges.sort_by(|a, b| a.cmp_default_heuristics(b));
+
+        let sorted_formats: Vec<SampleFormat> = ranges.iter().map(|r| r.sample_format()).collect();
+
+        // Expected order from lowest to highest priority:
+        assert_eq!(
+            sorted_formats,
+            vec![DsdU8, DsdU16, DsdU32, U8, I8, U64, I64, U16, I16, U24, I24, U32, I32, F64, F32,]
+        );
+    }
+
+    #[test]
+    fn cmp_default_heuristics() {
+        let mut configs = [
+            make_range(1, SampleFormat::F64, 1, 96_000), // mono; loses to all stereo
+            make_range(2, SampleFormat::DsdU8, 1, 96_000), // DSD; lowest format priority
+            make_range(2, SampleFormat::U8, 1, 96_000),
+            make_range(2, SampleFormat::I8, 1, 96_000),
+            make_range(2, SampleFormat::U16, 1, 96_000),
+            make_range(2, SampleFormat::I16, 1, 96_000),
+            make_range(2, SampleFormat::F32, 1, 22_050), // neither standard rate
+            make_range(2, SampleFormat::F32, 1, 44_100), // 44.1 kHz only
+            make_range(2, SampleFormat::F32, 48_000, 96_000), // 48 kHz only
+            make_range(2, SampleFormat::F32, 1, 96_000), // both standard rates
+            make_range(2, SampleFormat::F64, 1, 96_000),
+        ];
+
+        configs.sort_by(|a, b| a.cmp_default_heuristics(b));
+
+        // Results in ascending priority order (lowest first):
+
+        // [0] Mono loses to every stereo entry regardless of format or rate.
+        assert_eq!(configs[0].channels(), 1);
+        assert_eq!(configs[0].sample_format(), SampleFormat::F64);
+
+        // [1]–[5] Stereo entries ranked by format (DSD < 8-bit < 16-bit).
+        assert_eq!(configs[1].sample_format(), SampleFormat::DsdU8);
+        assert_eq!(configs[2].sample_format(), SampleFormat::U8);
+        assert_eq!(configs[3].sample_format(), SampleFormat::I8);
+        assert_eq!(configs[4].sample_format(), SampleFormat::U16);
+        assert_eq!(configs[5].sample_format(), SampleFormat::I16);
+
+        // [6] F64 is outranked by F32.
+        assert_eq!(configs[6].sample_format(), SampleFormat::F64);
+        assert_eq!(configs[6].channels(), 2);
+
+        // [7]–[10] Stereo F32 entries ranked by rate coverage.
+        assert_eq!(configs[7].sample_format(), SampleFormat::F32);
+        assert_eq!(configs[7].max_sample_rate(), 22_050); // neither standard rate
+
+        assert_eq!(configs[8].sample_format(), SampleFormat::F32);
+        assert_eq!(configs[8].max_sample_rate(), 44_100); // 44.1 kHz only
+
+        assert_eq!(configs[9].sample_format(), SampleFormat::F32);
+        assert_eq!(configs[9].min_sample_rate(), 48_000); // 48 kHz only (no 44.1 kHz)
+        assert_eq!(configs[9].max_sample_rate(), 96_000);
+
+        assert_eq!(configs[10].sample_format(), SampleFormat::F32);
+        assert_eq!(configs[10].min_sample_rate(), 1);
+        assert_eq!(configs[10].max_sample_rate(), 96_000); // both standard rates
+    }
+
+    #[test]
+    fn validate_stream_config_rejects_zero_channels() {
+        let err = validate_stream_config(&StreamConfig {
+            channels: 0,
+            sample_rate: 44100,
+            buffer_size: BufferSize::Default,
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.message().unwrap().contains("channel"));
+    }
+
+    #[test]
+    fn validate_stream_config_rejects_zero_sample_rate() {
+        let err = validate_stream_config(&StreamConfig {
+            channels: 2,
+            sample_rate: 0,
+            buffer_size: BufferSize::Default,
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.message().unwrap().contains("sample rate"));
+    }
+
+    #[test]
+    fn validate_stream_config_rejects_fixed_buffer_zero() {
+        let err = validate_stream_config(&StreamConfig {
+            channels: 2,
+            sample_rate: 44100,
+            buffer_size: BufferSize::Fixed(0),
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.message().unwrap().contains("buffer size"));
+    }
+
+    #[test]
+    fn validate_stream_config_accepts_valid_configs() {
+        assert!(validate_stream_config(&StreamConfig {
+            channels: 2,
+            sample_rate: 44100,
+            buffer_size: BufferSize::Default,
+        })
+        .is_ok());
+        assert!(validate_stream_config(&StreamConfig {
+            channels: 1,
+            sample_rate: 1,
+            buffer_size: BufferSize::Fixed(1),
+        })
+        .is_ok());
+    }
+}
